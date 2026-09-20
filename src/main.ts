@@ -383,7 +383,7 @@ export default class ImaDuoPlugin extends Plugin {
   }
 
   log(msg: string) {
-    console.log("[ima-duo]", msg);
+    console.debug("[ima-duo]", msg);
     if (!this.settings.enableDebugLog) return;
     try {
       const dir = this.manifest.dir;
@@ -399,7 +399,7 @@ export default class ImaDuoPlugin extends Plugin {
   }
 
   logFilePath(): string {
-    const dir = this.manifest.dir || ".obsidian/plugins/ima-duo";
+    const dir = this.manifest.dir || `${this.app.vault.configDir}/plugins/ima-duo`;
     return `${dir}/ima-debug.log`;
   }
 
