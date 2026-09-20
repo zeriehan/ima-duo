@@ -1,6 +1,6 @@
 {
   "name": "ima-duo",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "description": "Obsidian <-> IMA 双向同步插件（推送文件/文件夹到知识库或笔记，拉取个人笔记到 vault）",
   "main": "main.js",
   "scripts": {

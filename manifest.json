@@ -1,7 +1,7 @@
 {
   "id": "ima-duo",
   "name": "IMA Duo Sync",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "minAppVersion": "1.11.4",
   "description": "同步 Obsidian 与 IMA：把文件与文件夹推送到 IMA 知识库或个人笔记，也能把 IMA 的笔记与知识库拉回 vault。",
   "author": "zeriehan",
