@@ -1,0 +1,387 @@
+/* ── IMA Duo Sync 设置页样式 ──────────────────────────────────────────────
+   视觉语言对齐 ima.copilot Sync：分组底板 + 去掉组内分割线 + 宽输入框
+   ──────────────────────────────────────────────────────────────────────── */
+
+/* 设置分组底板（凭证组 / 拉取组 / 推送组通用） */
+.ima-cred-box,
+.ima-kb-box {
+	background: var(--background-secondary);
+	border-radius: 8px;
+	padding: 4px 0;
+	margin-bottom: 16px;
+	overflow: hidden;
+}
+
+/* 组内去掉 setting-item 自带的上下分割线，视觉上融为一体 */
+.ima-cred-box.ima-cred-box .setting-item,
+.ima-kb-box.ima-kb-box .setting-item {
+	border-top: none;
+	border-bottom: none;
+}
+
+/* 宽输入框（Client ID / API Key） */
+.ima-input-wide {
+	width: 400px;
+}
+
+/* 相邻的两个 setting 之间补一条细分割线（组内最后一项除外） */
+.ima-kb-box .setting-item:not(:last-child) {
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+
+/* 次要说明文字 */
+.ima-muted {
+	color: var(--text-muted);
+	font-size: 0.85em;
+}
+
+/* 知识库勾选列表行 */
+.ima-kb-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 4px 0;
+}
+
+.ima-kb-row label {
+	cursor: pointer;
+	flex: 1;
+}
+
+.ima-kb-checkbox {
+	margin-right: 4px;
+}
+
+/* 知识库分组标题 */
+.ima-kb-group-header {
+	font-weight: bold;
+	font-size: 0.9em;
+	color: var(--text-muted);
+	margin: 12px 0 4px 0;
+	padding-top: 8px;
+	border-top: 1px solid var(--background-modifier-border);
+}
+
+/* 知识库条目数 / ID 灰字 */
+.ima-kb-id {
+	color: var(--text-muted);
+	font-size: 0.85em;
+}
+
+/* 按钮横排 */
+.ima-btn-row {
+	display: flex;
+	gap: 8px;
+	margin-top: 12px;
+	flex-wrap: wrap;
+}
+
+/* 推送确认弹窗里的目标摘要行 */
+.ima-push-summary {
+	background: var(--background-secondary);
+	border-radius: 8px;
+	padding: 8px 12px;
+	margin: 8px 0 4px;
+}
+
+/* 通用隐藏类 */
+.ima-hidden {
+	display: none;
+}
+
+/* 重复文件清单（清理拉取重复弹窗） */
+.ima-dup-list {
+	max-height: 220px;
+	overflow-y: auto;
+	background: var(--background-secondary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	padding: 8px 12px;
+	margin: 6px 0 12px;
+	font-size: 0.85em;
+	line-height: 1.6;
+	word-break: break-all;
+}
+
+.ima-dup-list div {
+	color: var(--text-muted);
+}
+
+/* ── 分身卡片 ─────────────────────────────────────────────────────────── */
+
+/* 每个分身一张可折叠卡片 */
+.ima-profile {
+	background: var(--background-primary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	margin: 8px 12px;
+	overflow: hidden;
+}
+
+.ima-profile > summary.ima-profile-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	cursor: pointer;
+	padding: 8px 12px;
+	background: var(--background-secondary);
+	list-style: none;
+}
+
+.ima-profile > summary.ima-profile-head::-webkit-details-marker {
+	display: none;
+}
+
+.ima-profile[open] > summary.ima-profile-head {
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+
+/* 序号徽标 */
+.ima-profile-badge {
+	flex: 0 0 auto;
+	font-size: 0.75em;
+	font-weight: bold;
+	padding: 2px 6px;
+	border-radius: 4px;
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+}
+
+.ima-profile-name {
+	font-weight: bold;
+}
+
+.ima-profile-meta {
+	margin-left: auto;
+	color: var(--text-muted);
+	font-size: 0.85em;
+}
+
+/* 卡片内的 setting-item 去掉分隔线，节奏更紧凑 */
+.ima-profile .setting-item {
+	border-top: none;
+	border-bottom: none;
+	padding: 8px 12px;
+}
+
+/* 目标 / 已选项的 chip 列表 */
+.ima-chip-list {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	padding: 0 12px 4px;
+}
+
+.ima-chip {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	background: var(--background-secondary);
+	border-radius: 6px;
+	padding: 4px 8px;
+}
+
+.ima-chip-text {
+	flex: 1;
+	font-size: 0.9em;
+	word-break: break-all;
+}
+
+.ima-chip-btn {
+	flex: 0 0 auto;
+	font-size: 0.8em;
+	padding: 1px 8px;
+	height: auto;
+	line-height: 1.5;
+}
+
+/* 空状态提示 */
+.ima-empty-hint {
+	color: var(--text-muted);
+	font-size: 0.9em;
+	padding: 12px;
+}
+
+/* ── 文件夹多选弹窗 ───────────────────────────────────────────────────── */
+
+.ima-search-row {
+	margin: 4px 0 8px;
+}
+
+.ima-search-input {
+	width: 100%;
+}
+
+.ima-folder-list {
+	max-height: 320px;
+	overflow-y: auto;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	padding: 8px 12px;
+}
+
+.ima-folder-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 3px 0;
+}
+
+.ima-folder-row label {
+	cursor: pointer;
+	flex: 1;
+	word-break: break-all;
+}
+
+/* 移动端提示框 */
+.ima-mobile-notice {
+	background: var(--background-secondary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	padding: 12px 16px;
+	margin-bottom: 16px;
+}
+
+.ima-mobile-notice p {
+	margin: 0;
+	font-size: 0.9em;
+	line-height: 1.5;
+}
+
+/* ── 同步面板（侧边栏图标打开的界面） ────────────────────────────────── */
+
+/* 顶部常用入口 */
+.ima-panel-quick {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin-bottom: 16px;
+}
+
+.ima-panel-quick-btn {
+	flex: 0 0 auto;
+}
+
+/* 一栏（推送 / 拉取）的底板 */
+.ima-panel-sec {
+	background: var(--background-secondary);
+	border-radius: 8px;
+	padding: 10px 12px 12px;
+	margin-bottom: 16px;
+}
+
+.ima-panel-sec-head {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	margin-bottom: 8px;
+}
+
+.ima-panel-sec-title {
+	font-weight: 700;
+}
+
+.ima-panel-sec-sub {
+	margin-left: auto;
+	color: var(--text-muted);
+	font-size: 0.85em;
+}
+
+.ima-panel-list {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+/* 一条分身 */
+.ima-panel-row {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	background: var(--background-primary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	padding: 8px 10px;
+}
+
+.ima-panel-row:hover {
+	border-color: var(--background-modifier-border-hover);
+}
+
+.ima-panel-row-main {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.ima-panel-row-name {
+	font-weight: 600;
+}
+
+/* 源 → 目标：太长就省略，别把行撑高 */
+.ima-panel-row-meta {
+	color: var(--text-muted);
+	font-size: 0.85em;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.ima-panel-row-sub {
+	color: var(--text-faint);
+	font-size: 0.8em;
+	margin-top: 2px;
+}
+
+.ima-panel-warn {
+	color: var(--text-error);
+}
+
+.ima-panel-run {
+	flex: 0 0 auto;
+}
+
+.ima-panel-empty {
+	color: var(--text-muted);
+	font-size: 0.9em;
+	padding: 6px 2px;
+}
+
+/* 底部辅助动作 */
+.ima-panel-foot {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+}
+
+.ima-panel-foot-btn {
+	flex: 0 0 auto;
+	font-size: 0.85em;
+}
+
+.ima-panel-status {
+	margin-top: 12px;
+	color: var(--text-muted);
+	font-size: 0.85em;
+}
+
+/* ── 自动同步 ─────────────────────────────────────────────────────────── */
+
+/* 间隔输入框：只需放下两三位数字，别占满一行 */
+.ima-input-narrow {
+	width: 80px;
+}
+
+/* 面板里的自动同步小设置条：沿用分组底板，但项与项之间不要分割线 */
+.ima-panel-autosync .setting-item {
+	border-top: none;
+	border-bottom: none;
+	padding: 5px 0;
+}
+
+.ima-panel-autosync .setting-item-name {
+	font-size: 0.92em;
+}
+
+.ima-panel-autosync .setting-item-description {
+	font-size: 0.8em;
+}
