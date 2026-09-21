@@ -145,8 +145,8 @@ interface ImaDuoSettings {
 
   /** 自动同步总开关：关闭时不起定时器，一切照旧手动跑 */
   autoSyncEnabled: boolean;
-  /** 自动同步间隔（分钟，最小 1） */
-  autoSyncIntervalMin: number;
+  /** 每天自动同步的时刻表（24 小时制 "HH:MM"，已排序去重）。空数组 = 不自动跑 */
+  autoSyncTimes: string[];
   /** 自动同步跑哪边：both=推送+拉取（默认），push=仅推送，pull=仅拉取 */
   autoSyncMode: "both" | "push" | "pull";
   /** 上次自动同步完成时间（epoch ms，0 = 从未跑过），用于设置页/面板显示 */
@@ -178,7 +178,7 @@ const DEFAULT_SETTINGS: ImaDuoSettings = {
   pulledPaths: [],
   enableDebugLog: false,
   autoSyncEnabled: false,
-  autoSyncIntervalMin: 30,
+  autoSyncTimes: ["09:00"],
   autoSyncMode: "both",
   autoSyncLastAt: 0,
 };
@@ -229,6 +229,75 @@ export function autoSyncModeLabel(m: string): string {
   return "推送 + 拉取";
 }
 
+/**
+ * 把 "9:5" / "09:05" / "0905" 这类写法规范成 24 小时制的 "HH:MM"。
+ * 解析不了或超出范围时返回 null（调用方负责丢弃）。
+ */
+export function normalizeTimeValue(raw: unknown): string | null {
+  const s = String(raw ?? "").trim();
+  const m = /^(\d{1,2}):(\d{1,2})$/.exec(s) || /^(\d{2})(\d{2})$/.exec(s);
+  if (!m) return null;
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+  if (!Number.isInteger(h) || !Number.isInteger(min)) return null;
+  if (h < 0 || h > 23 || min < 0 || min > 59) return null;
+  return `${String(h).padStart(2, "0")}:${String(min).padStart(2, "0")}`;
+}
+
+/** 规范时刻表：逐个校验、去重、按时间先后排序 */
+export function normalizeTimeList(list: unknown): string[] {
+  if (!Array.isArray(list)) return [];
+  const out: string[] = [];
+  for (const raw of list) {
+    const t = normalizeTimeValue(raw);
+    if (t && !out.includes(t)) out.push(t);
+  }
+  return out.sort();
+}
+
+/** 某个时刻在「day 这一天」对应的本地时间戳 */
+function timeOnDayAt(time: string, day: Date): number {
+  const [h, m] = time.split(":").map(Number);
+  return new Date(day.getFullYear(), day.getMonth(), day.getDate(), h, m, 0, 0).getTime();
+}
+
+/** 下一个到点时刻（严格晚于 now）；没配置则 null */
+export function nextTimeAt(times: string[], now: number): number | null {
+  let best: number | null = null;
+  for (const t of times) {
+    const d = new Date(now);
+    let at = timeOnDayAt(t, d);
+    if (at <= now) {
+      d.setDate(d.getDate() + 1);
+      at = timeOnDayAt(t, d);
+    }
+    if (best === null || at < best) best = at;
+  }
+  return best;
+}
+
+/** 已经过去的最近一个时刻（用来判断「错过了要不要补跑」）；没配置则 null */
+export function lastTimeAt(times: string[], now: number): number | null {
+  let best: number | null = null;
+  for (const t of times) {
+    const d = new Date(now);
+    let at = timeOnDayAt(t, d);
+    if (at > now) {
+      d.setDate(d.getDate() - 1);
+      at = timeOnDayAt(t, d);
+    }
+    if (best === null || at > best) best = at;
+  }
+  return best;
+}
+
+/** 「＋ 添加时刻」的初值：空表给 09:00，否则比最后一个晚一小时（加闹钟的手感） */
+export function nextSuggestedTime(times: string[]): string {
+  if (!times.length) return "09:00";
+  const [h] = times[times.length - 1].split(":").map(Number);
+  return `${String((h + 1) % 24).padStart(2, "0")}:00`;
+}
+
 /** 拉取重复清理的候选项：疑似旧版 uniquePath 产生的 `a-2.md` */
 export interface DupCandidate {
   file: TFile;
@@ -259,9 +328,9 @@ export default class ImaDuoPlugin extends Plugin {
   private pulledPaths = new Set<string>();
   private statusEl: HTMLElement | null = null;
 
-  /** 自动同步定时器句柄（关闭 / 改间隔时重建） */
+  /** 下一次到点的定时器句柄（关闭 / 改时刻表时重建） */
   private autoSyncTimer: number | null = null;
-  /** 启动后补跑一次的定时器句柄 */
+  /** 启动后补跑（追平错过的时刻）的定时器句柄 */
   private startupTimer: number | null = null;
   /** 一轮自动同步进行中标记：避免与自身或手动任务叠跑 */
   private autoSyncRunning = false;
@@ -500,45 +569,67 @@ export default class ImaDuoPlugin extends Plugin {
   autoSyncStatusText(): string {
     const s = this.settings;
     if (!s.autoSyncEnabled) return "已关闭";
+    const times = normalizeTimeList(s.autoSyncTimes);
     const last = s.autoSyncLastAt
       ? new Date(s.autoSyncLastAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
       : "尚未运行";
-    return `每 ${s.autoSyncIntervalMin} 分钟 · ${autoSyncModeLabel(s.autoSyncMode)} · 上次 ${last}`;
+    const when = times.length ? `每天 ${times.join("、")}` : "未设时刻";
+    return `${when} · ${autoSyncModeLabel(s.autoSyncMode)} · 上次 ${last}`;
   }
 
   /**
-   * 按当前设置（重）建自动同步定时器。开关切换、间隔/内容变更都走这里，
-   * 保证任何时候只有一个定时器在跑。关闭时清掉全部定时器。
+   * 按当前设置（重）建自动同步定时器。开关、时刻表、内容任一项变动都走这里，
+   * 保证任何时候只挂一个到点定时器。关闭或时刻表为空时清掉全部定时器。
    */
   restartAutoSync() {
-    if (this.autoSyncTimer !== null) {
-      window.clearInterval(this.autoSyncTimer);
-      this.autoSyncTimer = null;
-    }
-    if (this.startupTimer !== null) {
-      window.clearTimeout(this.startupTimer);
-      this.startupTimer = null;
-    }
+    this.stopAutoSync();
     const s = this.settings;
     if (!s.autoSyncEnabled) return;
 
-    // 间隔至少 1 分钟；顺手把非法值纠回默认
-    const min = Math.max(1, Math.floor(Number(s.autoSyncIntervalMin) || 0) || 30);
-    s.autoSyncIntervalMin = min;
+    s.autoSyncTimes = normalizeTimeList(s.autoSyncTimes);
+    if (!s.autoSyncTimes.length) {
+      this.log("自动同步已开启，但没设时刻：不会自动跑");
+      return;
+    }
 
-    this.autoSyncTimer = window.setInterval(() => void this.runAutoSync(), min * 60_000);
-    // 启动后补跑一次：Obsidian 刚起来时定时器还没到点，先补一轮，省得等一整个间隔
-    this.startupTimer = window.setTimeout(() => {
-      this.startupTimer = null;
-      void this.runAutoSync();
-    }, 20_000);
-    this.log(`自动同步已开启：每 ${min} 分钟（${autoSyncModeLabel(s.autoSyncMode)}）`);
+    // 错过补跑：最近一个应跑时刻晚于上次运行（含从未跑过）→ 启动后补一轮。
+    // 只补一次，不是把错过的每个时刻都跑一遍。
+    const last = lastTimeAt(s.autoSyncTimes, Date.now());
+    if (last !== null && s.autoSyncLastAt < last) {
+      this.startupTimer = window.setTimeout(() => {
+        this.startupTimer = null;
+        void this.runAutoSync();
+      }, 20_000);
+    }
+    this.armNextAutoSync();
+    this.log(
+      `自动同步已开启：每天 ${s.autoSyncTimes.join("、")}（${autoSyncModeLabel(s.autoSyncMode)}）`,
+    );
   }
 
-  /** 停止自动同步并清定时器（onunload / 关闭开关时用） */
+  /** 排下一次到点执行；触发后自己续上下一轮（一天一个，不堆积） */
+  private armNextAutoSync() {
+    if (this.autoSyncTimer !== null) {
+      window.clearTimeout(this.autoSyncTimer);
+      this.autoSyncTimer = null;
+    }
+    const next = nextTimeAt(normalizeTimeList(this.settings.autoSyncTimes), Date.now());
+    if (next === null) return;
+    // setTimeout 上限 2^31-1 ms（约 24.8 天），这里最多一天，取个小于上限的值保险
+    const delay = Math.max(1_000, Math.min(next - Date.now(), 2_147_000_000));
+    this.autoSyncTimer = window.setTimeout(() => {
+      this.autoSyncTimer = null;
+      void this.runAutoSync().then(
+        () => this.armNextAutoSync(),
+        () => this.armNextAutoSync(),
+      );
+    }, delay);
+  }
+
+  /** 停止自动同步并清定时器（onunload / 关闭开关 / 改设置时用） */
   stopAutoSync() {
     if (this.autoSyncTimer !== null) {
-      window.clearInterval(this.autoSyncTimer);
+      window.clearTimeout(this.autoSyncTimer);
       this.autoSyncTimer = null;
     }
     if (this.startupTimer !== null) {
@@ -548,7 +639,7 @@ export default class ImaDuoPlugin extends Plugin {
   }
 
   /**
-   * 跑一轮自动同步。间隔到点、启动补跑、面板/设置页「立即同步」共用这一个入口。
+   * 跑一轮自动同步。到点、启动补跑、面板/设置页「立即同步」共用这一个入口。
    * 三条守卫：已有同步在跑 → 跳过；手动推/拉正在进行 → 跳过；没有任何可跑分身 → 跳过。
    */
   async runAutoSync(opts: { manual?: boolean } = {}) {
@@ -601,6 +692,54 @@ export default class ImaDuoPlugin extends Plugin {
       this.quietRun = prevQuiet;
       this.autoSyncRunning = false;
     }
+  }
+
+  /**
+   * 渲染「同步时刻」编辑器：一行一个时刻（24 小时制），＋ 添加、✕ 删除。
+   * 设置页与侧边栏面板共用同一套 UI；onChange 在增删改之后调用，
+   * 用来重建定时器并重绘当前界面。
+   */
+  renderAutoSyncTimes(containerEl: HTMLElement, onChange: () => void) {
+    const s = this.settings;
+    const enabled = s.autoSyncEnabled;
+    const times = normalizeTimeList(s.autoSyncTimes);
+    const list = containerEl.createDiv({ cls: "ima-time-list" });
+
+    times.forEach((t, i) => {
+      const row = list.createDiv({ cls: "ima-time-row" });
+      const input = row.createEl("input", { cls: "ima-input-time" });
+      input.type = "time";
+      input.value = t;
+      input.disabled = !enabled;
+      input.setAttribute("aria-label", `第 ${i + 1} 个同步时刻`);
+      input.onchange = () => {
+        const next = times.slice();
+        next[i] = input.value;
+        void this.commitAutoSyncTimes(next, onChange);
+      };
+
+      const del = row.createEl("button", { cls: "ima-time-del", text: "✕" });
+      del.setAttribute("aria-label", `删除第 ${i + 1} 个同步时刻`);
+      del.disabled = !enabled;
+      del.onclick = () => {
+        void this.commitAutoSyncTimes(
+          times.filter((_, k) => k !== i),
+          onChange,
+        );
+      };
+    });
+
+    const add = list.createEl("button", { cls: "ima-time-add", text: "＋ 添加时刻" });
+    add.disabled = !enabled;
+    add.onclick = () => void this.commitAutoSyncTimes([...times, nextSuggestedTime(times)], onChange);
+  }
+
+  /** 保存时刻表并重排定时器（增 / 删 / 改共用） */
+  private async commitAutoSyncTimes(next: string[], onChange: () => void) {
+    this.settings.autoSyncTimes = normalizeTimeList(next);
+    await this.saveSettings();
+    this.restartAutoSync();
+    onChange();
   }
 
   // ---------- 推送 ----------
@@ -1906,6 +2045,13 @@ export default class ImaDuoPlugin extends Plugin {
     }
     // 老配置没有这两个开关，补上默认值
     if (typeof this.settings.skipOldVersions !== "boolean") this.settings.skipOldVersions = true;
+
+    // 自动同步已从「每 N 分钟」改成「每天固定时刻」：清掉废弃字段，时刻表规范化
+    const bag = this.settings as unknown as Record<string, unknown>;
+    if ("autoSyncIntervalMin" in bag) delete bag.autoSyncIntervalMin;
+    this.settings.autoSyncTimes = Array.isArray(this.settings.autoSyncTimes)
+      ? normalizeTimeList(this.settings.autoSyncTimes)
+      : [...DEFAULT_SETTINGS.autoSyncTimes];
   }
   async saveSettings() {
     await this.saveData(this.settings);
@@ -2096,7 +2242,7 @@ class ImaDuoPanelModal extends Modal {
 
     new Setting(sec)
       .setName("启用")
-      .setDesc("按间隔自动跑，关闭则只手动同步")
+      .setDesc("到点自动跑，关闭则只手动同步")
       .addToggle((t) =>
         t.setValue(p.settings.autoSyncEnabled).onChange(async (v) => {
           p.settings.autoSyncEnabled = v;
@@ -2106,20 +2252,9 @@ class ImaDuoPanelModal extends Modal {
         }),
       );
 
-    new Setting(sec)
-      .setName("间隔")
-      .setDesc("分钟（≥1）")
-      .addText((t) => {
-        t.inputEl.type = "number";
-        t.inputEl.min = "1";
-        t.inputEl.addClass("ima-input-narrow");
-        t.setValue(String(p.settings.autoSyncIntervalMin)).onChange(async (v) => {
-          p.settings.autoSyncIntervalMin = Math.max(1, Math.floor(Number(v) || 0) || 30);
-          await p.saveSettings();
-          p.restartAutoSync();
-        });
-        t.setDisabled(!p.settings.autoSyncEnabled);
-      });
+    new Setting(sec).setName("时刻").setDesc("24 小时制，可加多个");
+
+    p.renderAutoSyncTimes(sec, () => this.render());
 
     new Setting(sec)
       .setName("内容")
@@ -2794,7 +2929,7 @@ class ImaDuoSettingTab extends PluginSettingTab {
       .setName("启用自动同步")
       .setDesc(
         richDesc((w) => {
-          w.appendText("按设定间隔自动执行全部推送与全部拉取，省去手动操作。");
+          w.appendText("到设定时刻自动执行全部推送与全部拉取，省去手动操作。");
           w.createEl("br");
           w.createSpan({ text: `当前：${p.autoSyncStatusText()}`, attr: muted });
         }),
@@ -2809,21 +2944,16 @@ class ImaDuoSettingTab extends PluginSettingTab {
       );
 
     new Setting(autoBox)
-      .setName("同步间隔（分钟）")
-      .setDesc("最小 1 分钟，修改后立即生效，不用重启 Obsidian")
-      .addText((t) => {
-        t.inputEl.type = "number";
-        t.inputEl.min = "1";
-        t.inputEl.addClass("ima-input-narrow");
-        t.setValue(String(p.settings.autoSyncIntervalMin))
-          .setPlaceholder("30")
-          .onChange(async (v) => {
-            p.settings.autoSyncIntervalMin = Math.max(1, Math.floor(Number(v) || 0) || 30);
-            await p.saveSettings();
-            p.restartAutoSync();
-          });
-        t.setDisabled(!p.settings.autoSyncEnabled);
-      });
+      .setName("同步时刻（24 小时制）")
+      .setDesc(
+        richDesc((w) => {
+          w.appendText("每天到点自动跑一轮，可以加多个时刻，像闹钟一样。");
+          w.createEl("br");
+          w.appendText("到点时如果 Obsidian 没开着，下次启动后补跑一次；留空则不会自动跑。");
+        }),
+      );
+
+    p.renderAutoSyncTimes(autoBox, () => this.display());
 
     new Setting(autoBox)
       .setName("同步内容")
@@ -2844,7 +2974,7 @@ class ImaDuoSettingTab extends PluginSettingTab {
 
     new Setting(autoBox)
       .setName("立即同步一次")
-      .setDesc("不必等下一次间隔，立刻按上面的设置执行一轮")
+      .setDesc("不必等下一个时刻，立刻按上面的设置执行一轮")
       .addButton((b) =>
         b.setButtonText("立即同步").onClick(async () => {
           b.setDisabled(true);

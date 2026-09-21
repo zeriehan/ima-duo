@@ -366,9 +366,57 @@
 
 /* ── 自动同步 ─────────────────────────────────────────────────────────── */
 
-/* 间隔输入框：只需放下两三位数字，别占满一行 */
-.ima-input-narrow {
-	width: 80px;
+/* 时刻表：一行一个时刻，可增可删 */
+.ima-time-list {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 6px;
+	margin: 2px 0 10px;
+}
+
+.ima-time-row {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+
+/* 24 小时制时刻输入框：宽度固定、数字等宽；外观自己给足，
+   不依赖宿主是否给 input[type=time] 基础样式（原生的 text 样式不一定覆盖 time） */
+.ima-input-time {
+	width: 7.5em;
+	padding: 4px 8px;
+	font-family: inherit;
+	font-size: 0.9em;
+	color: var(--text-normal);
+	background-color: var(--background-modifier-form-field);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+	font-variant-numeric: tabular-nums;
+}
+
+.ima-input-time:hover {
+	border-color: var(--background-modifier-border-hover, var(--background-modifier-border));
+}
+
+/* 删除按钮做成轻量图标按钮，不抢时刻输入的注意力 */
+.ima-time-del {
+	padding: 2px 8px;
+	line-height: 1.4;
+	color: var(--text-muted);
+	background-color: transparent;
+	border: none;
+	box-shadow: none;
+}
+
+.ima-time-del:hover {
+	color: var(--text-normal);
+	background-color: var(--background-modifier-hover);
+}
+
+.ima-input-time:disabled,
+.ima-time-del:disabled {
+	opacity: 0.45;
 }
 
 /* 面板里的自动同步小设置条：沿用分组底板，但项与项之间不要分割线 */
