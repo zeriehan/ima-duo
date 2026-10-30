@@ -53,6 +53,13 @@ export interface PushOpts {
   prev?: PushState;
   /** 每处理完一个文件回传最新记录，由调用方合并进持久化状态 */
   onRecord?: (path: string, rec: PushRecord) => void;
+  /** 进度回调：第几个 / 共几个、已处理字节 / 总字节（用于面板与状态栏的实时数字） */
+  onProgress?: (p: {
+    done: number;
+    total: number;
+    bytesDone: number;
+    bytesTotal: number;
+  }) => void;
 }
 
 /** 某个文件相对某个目标的上次推送记录 */
@@ -446,7 +453,13 @@ export async function pushFiles(
     return idx;
   };
 
+  const totalCount = items.length;
+  const totalBytes = items.reduce((s, i) => s + (Number(i.file.stat?.size) || 0), 0);
+  let doneCount = 0;
+  let doneBytes = 0;
+
   for (const it of items) {
+   try {
     const file = it.file;
     let folderId: string | null = null;
     /** 落地在知识库里的文件夹路径（"" = 根），随记录一起存，方便日后定位待清理条目 */
@@ -556,6 +569,17 @@ export async function pushFiles(
     } catch (e: any) {
       skipped++;
       onLog && onLog(`失败 ${it.file.path}: ${e.message}`);
+    }
+   } finally {
+      // 每处理完一个（含跳过/未变化）都报一次，进度条上的数字才不会卡住
+      doneCount++;
+      doneBytes += Number(it.file.stat?.size) || 0;
+      opts.onProgress?.({
+        done: doneCount,
+        total: totalCount,
+        bytesDone: doneBytes,
+        bytesTotal: totalBytes,
+      });
     }
   }
   return { pushed, skipped, exists, renamed, unchanged };

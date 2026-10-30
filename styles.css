@@ -360,8 +360,11 @@
 
 .ima-panel-status {
 	margin-top: 12px;
+	min-height: 1.2em;
 	color: var(--text-muted);
 	font-size: 0.85em;
+	text-align: right;
+	font-variant-numeric: tabular-nums;
 }
 
 /* ── 自动同步 ─────────────────────────────────────────────────────────── */

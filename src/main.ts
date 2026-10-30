@@ -221,6 +221,14 @@ export function isStaleKbId(id?: string): boolean {
   return !!id && !MODERN_KB_ID.test(id);
 }
 
+/** 人类可读的字节数（1.4MB / 812KB），进度行用 */
+export function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "0B";
+  if (n < 1024) return `${Math.round(n)}B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10 * 1024 ? 1 : 0)}KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)}MB`;
+}
+
 /** 目标的可读标签，用于设置页展示 */
 export function targetLabel(t: PushTarget | null): string {
   if (!t) return "";
@@ -365,6 +373,10 @@ export default class ImaDuoPlugin extends Plugin {
 
   private pulledPaths = new Set<string>();
   private statusEl: HTMLElement | null = null;
+  /** 最近一次状态文案：面板重绘后拿它恢复，不至于空白 */
+  statusText = "";
+  /** 面板底部那行实时状态（面板打开时注册） */
+  panelStatusEl: HTMLElement | null = null;
 
   /** 下一次到点的定时器句柄（关闭 / 改时刻表时重建） */
   private autoSyncTimer: number | null = null;
@@ -486,7 +498,10 @@ export default class ImaDuoPlugin extends Plugin {
   // ---------- 基础设施 ----------
 
   setStatus(text: string) {
+    this.statusText = text;
     if (this.statusEl) this.statusEl.setText(text);
+    // 同步面板开着时，底部的实时进度行也跟着走
+    if (this.panelStatusEl) this.panelStatusEl.setText(text);
   }
 
   log(msg: string) {
@@ -1029,6 +1044,10 @@ export default class ImaDuoPlugin extends Plugin {
       onRecord: (p, rec) => {
         fresh[p] = rec;
       },
+      onProgress: (g) =>
+        this.setStatus(
+          `推送 ${g.done}/${g.total} · ${formatBytes(g.bytesDone)}/${formatBytes(g.bytesTotal)}`,
+        ),
     };
     this.pushBusy = true;
     new Notice(`开始推送 ${files.length} 个文件到 ${targetLabel(target)}…`);
@@ -1259,6 +1278,10 @@ export default class ImaDuoPlugin extends Plugin {
       keepSourceRoot: prof.keepRoot !== false,
       onDuplicate: this.settings.onDuplicate === "rename" ? "rename" : "skip",
       inlineImages: this.settings.pushLocalImages !== false,
+      onProgress: (g) =>
+        this.setStatus(
+          `推送「${prof.name}」 ${g.done}/${g.total} · ${formatBytes(g.bytesDone)}/${formatBytes(g.bytesTotal)}`,
+        ),
     };
 
     this.pushBusy = true;
@@ -2337,6 +2360,7 @@ class ImaDuoPanelModal extends Modal {
   }
 
   onClose() {
+    this.plugin.panelStatusEl = null;
     this.contentEl.empty();
   }
 
@@ -2428,12 +2452,12 @@ class ImaDuoPanelModal extends Modal {
     // ── 自动同步（小设置，改完立即生效）──
     this.renderAutoSync(contentEl);
 
-    if (this.busy) {
-      contentEl.createDiv({
-        cls: "ima-panel-status",
-        text: "任务进行中……进度见左下角状态栏与通知",
-      });
-    }
+    // 底部状态行：右下角，跑任务时显示实时数字（12/68 · 1.4MB/5.2MB）
+    const statusLine = contentEl.createDiv({
+      cls: "ima-panel-status",
+      text: p.statusText || (this.busy ? "任务进行中…" : ""),
+    });
+    p.panelStatusEl = statusLine;
   }
 
   /** 面板里的「自动同步」小设置：开关 + 间隔 + 内容，改完立即生效 */
