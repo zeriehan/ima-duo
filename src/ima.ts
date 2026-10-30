@@ -26,6 +26,16 @@ function describeCode(code: any, msg?: string): string {
   return `${base}（code ${code}）${hint ? " —— " + hint : ""}`;
 }
 
+/** add_knowledge 的入参（笔记走 noteId，文件走 mediaId） */
+export interface AddKnowledgeOpts {
+  mediaType: number;
+  noteId?: string;
+  mediaId?: string;
+  title: string;
+  folderId?: string;
+  fileInfo?: Record<string, unknown>;
+}
+
 export class ImaClient {
   cid: string;
   key: string;
@@ -292,7 +302,11 @@ export class ImaClient {
   }
 
   // 把笔记/文件加入知识库
-  async addKnowledge(kbId: string, opts: any): Promise<void> {
+  /**
+   * 把条目挂进知识库。返回新条目的 `media_id` —— 回收站要靠它把旧版移走，
+   * 没拿到就等于以后认不出这条，所以调用方要把它记进推送记录。
+   */
+  async addKnowledge(kbId: string, opts: AddKnowledgeOpts): Promise<string> {
     const body: any = { knowledge_base_id: kbId, media_type: opts.mediaType };
     if (opts.noteId) {
       body.note_info = { content_id: opts.noteId };
@@ -304,7 +318,32 @@ export class ImaClient {
       body.file_info = opts.fileInfo;
     }
     if (opts.folderId) body.folder_id = opts.folderId;
-    await this.call("openapi/wiki/v1/add_knowledge", body);
+    const d = (await this.call("openapi/wiki/v1/add_knowledge", body)) as {
+      media_id?: string;
+      knowledge_id?: string;
+    };
+    return String(d.media_id || d.knowledge_id || "");
+  }
+
+  /**
+   * 把知识库里的条目移到另一个文件夹（`move_knowledge`，未文档化但可用）。
+   * 只支持**条目**，传文件夹会返回 `220001 不支持文件夹`。
+   * 返回是否真的每个条目都 `ret_code === 0` —— 接口层面几乎总报 success，不能只看 code。
+   */
+  async moveKnowledge(kbId: string, mediaIds: string[], folderId?: string): Promise<boolean> {
+    if (mediaIds.length === 0) return true;
+    const body: any = {
+      src_knowledge_base_id: kbId,
+      dst_knowledge_base_id: kbId,
+      infos: mediaIds.map((id) => ({ media_id: id })),
+    };
+    if (folderId) body.dst_folder_id = folderId;
+    const d = (await this.call("openapi/wiki/v1/move_knowledge", body)) as {
+      move_results?: Record<string, { ret_code?: number }>;
+    };
+    const results = d.move_results;
+    if (!results) return false;
+    return mediaIds.every((id) => Number(results[id]?.ret_code) === 0);
   }
 
   // 列出笔记本

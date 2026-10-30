@@ -60,10 +60,15 @@ export interface PushOpts {
     bytesDone: number;
     bytesTotal: number;
   }) => void;
+  /**
+   * 「回收站」：给了它就启用新版本策略 —— 改动后新条目**沿用原名**，
+   * 旧版用 `move_knowledge` 移到这个文件夹里（IMA 没有删除接口，只能搬走）。
+   * 老记录没有 `mediaId` 时自动退回 `@vN` 命名。
+   */
+  recycle?: { folderId: string; folderName: string };
 }
 
-/** 某个文件相对某个目标的上次推送记录 */
-export interface PushRecord {
+/** 某个文件相对某个目标的上次推送记录 */export interface PushRecord {
   /** 字节数，用于便宜的变更探测（省掉大文件的读盘） */
   size: number;
   /** 修改时间（ms），与 size 一起做快速排除 */
@@ -80,6 +85,11 @@ export interface PushRecord {
   isFile: boolean;
   /** 落地在知识库里的文件夹路径（"" = 根），用于在 IMA 客户端里定位待清理条目 */
   folder: string;
+  /**
+   * IMA 上这条的 `media_id`（`note_…` / `pdf_…`）。回收站靠它移动旧版；
+   * 老记录没有这个字段（升级前推的），只能退回带 `@vN` 的老办法。
+   */
+  mediaId?: string;
 }
 /** 推送状态表：文件 vault 路径 → 记录 */
 export type PushState = Record<string, PushRecord>;
@@ -496,19 +506,29 @@ export async function pushFiles(
       continue;
     }
 
-    // ② 改过了：IMA 没有覆盖接口，只能带版本号另存一份（旧版会留在库里，API 删不掉）
+    // ② 改过了：IMA 没有覆盖接口。启用回收站时新条目**沿用原名**、旧版搬走；
+    //    没启用（或老记录不知道 media_id）就退回带版本号另存。
+    const useRecycle = !!(opts.recycle && target.kind === "kb" && rec && rec.mediaId);
     let title = rawTitle;
     let version = 1;
     if (rec) {
-      version = (rec.version || 1) + 1;
-      title = versionedTitle(rawTitle, version, !isMd);
-      onLog &&
-        onLog(`「${rawTitle}」有改动 → 新建「${title}」（IMA 不支持覆盖，旧版留在库里）`);
+      if (useRecycle) {
+        onLog &&
+          onLog(
+            `「${rawTitle}」有改动 → 新建同名最新版，旧版移入${opts.recycle?.folderName}（标题不再带 @vN）`,
+          );
+      } else {
+        version = (rec.version || 1) + 1;
+        title = versionedTitle(rawTitle, version, !isMd);
+        onLog &&
+          onLog(`「${rawTitle}」有改动 → 新建「${title}」（IMA 不支持覆盖，旧版留在库里）`);
+      }
     }
 
     try {
       const taken = await loadTaken(dedupeFolder);
-      if (taken.has(title)) {
+      // 回收站模式下同名冲突是"自己家的旧版"，别按冲突处理（旧版马上会被搬走）
+      if (!useRecycle && taken.has(title)) {
         if (!rec && (opts.onDuplicate || "skip") === "rename") {
           // ③-a 首次 + 「改名新建」策略：按老规矩另存一份「名字 (2)」
           title = uniqueTitle(rawTitle, taken.exact, !isMd);
@@ -548,8 +568,35 @@ export async function pushFiles(
       onLog && onLog(`⚠️ 查重环节异常，仍继续推送：${e.message}`);
     }
     try {
-      const r = await pushOne(file, title, target, client, vault, opts, folderId, probe, onLog);
-      if (r === "pushed") {
+      const res = await pushOne(file, title, target, client, vault, opts, folderId, probe, onLog);
+      if (res.status === "pushed") {
+        // 新版已经建好；启用回收站时把旧版搬走（IMA 删不掉，只能移）
+        let recycled = false;
+        if (useRecycle && rec && rec.mediaId && target.kbId && opts.recycle) {
+          let moved = false;
+          try {
+            moved = await client.moveKnowledge(target.kbId, [rec.mediaId], opts.recycle.folderId);
+          } catch (e: any) {
+            onLog && onLog(`旧版移入${opts.recycle.folderName}失败：${e.message}`);
+          }
+          if (!moved) {
+            // 搬不动就把刚建的新版也塞进回收站，宁可这一轮不更新，也不留两个同名条目
+            try {
+              if (res.mediaId) {
+                await client.moveKnowledge(target.kbId, [res.mediaId], opts.recycle.folderId);
+              }
+            } catch {
+              // 连回滚都失败：至少日志里留痕，下次推还会重建
+            }
+            skipped++;
+            onLog &&
+              onLog(
+                `⚠️ 旧版没能移入${opts.recycle.folderName}，本次改动已回滚（不更新记录，下次再试）：${rawTitle}`,
+              );
+            continue;
+          }
+          recycled = true;
+        }
         pushed++;
         opts.onRecord &&
           opts.onRecord(file.path, {
@@ -561,10 +608,12 @@ export async function pushFiles(
             raw: rawTitle,
             isFile: !isMd,
             folder: folderPath,
+            mediaId: res.mediaId || undefined,
           });
+        if (recycled) onLog && onLog(`旧版「${rec?.title || rawTitle}」已移入${opts.recycle?.folderName}`);
       } else {
         skipped++;
-        onLog && onLog(`跳过 ${file.path}（${r}）`);
+        onLog && onLog(`跳过 ${file.path}（${res.status}）`);
       }
     } catch (e: any) {
       skipped++;
@@ -585,6 +634,46 @@ export async function pushFiles(
   return { pushed, skipped, exists, renamed, unchanged };
 }
 
+/**
+ * 本地已经删掉的文件：把 IMA 上对应条目搬进回收站。
+ * IMA 没有删除接口（`delete_knowledge` 实测是空操作），所以"删"只能是"移走"。
+ * 升级前推的条目没有 `media_id`，认不出来就跳过并计入 skipped，由调用方提示。
+ */
+export async function recycleDeletedEntries(
+  client: ImaClient,
+  kbId: string,
+  recycleFolderId: string,
+  recycleFolderName: string,
+  entries: Array<{ path: string; rec: PushRecord }>,
+  onLog?: (msg: string) => void,
+): Promise<{ moved: number; skipped: number; movedPaths: string[] }> {
+  let moved = 0;
+  let skipped = 0;
+  const movedPaths: string[] = [];
+  for (const { path, rec } of entries) {
+    if (!rec.mediaId) {
+      skipped++;
+      onLog && onLog(`「${rec.title}」没有 media_id（升级前推的），搬不进${recycleFolderName}：${path}`);
+      continue;
+    }
+    try {
+      const ok = await client.moveKnowledge(kbId, [rec.mediaId], recycleFolderId);
+      if (ok) {
+        moved++;
+        movedPaths.push(path);
+        onLog && onLog(`已删除「${path}」→「${rec.title}」移入${recycleFolderName}`);
+      } else {
+        skipped++;
+        onLog && onLog(`「${rec.title}」移入${recycleFolderName}失败：${path}`);
+      }
+    } catch (e) {
+      skipped++;
+      onLog && onLog(`「${rec.title}」移入${recycleFolderName}出错：${String(e)}`);
+    }
+  }
+  return { moved, skipped, movedPaths };
+}
+
 async function pushOne(
   file: TFile,
   title: string,
@@ -595,7 +684,7 @@ async function pushOne(
   folderId: string | null,
   pre?: Probe,
   onLog?: (msg: string) => void,
-): Promise<string> {
+): Promise<{ status: string; mediaId: string }> {
   const ext = file.extension.toLowerCase();
   if (ext === "md") {
     // 探测阶段读到的正文直接用，别再读一遍盘
@@ -610,9 +699,10 @@ async function pushOne(
       if (r.inlined > 0) onLog && onLog(`已把 ${r.inlined} 张本地图片内联进「${title}」`);
       if (r.skipped > 0) onLog && onLog(`「${title}」有 ${r.skipped} 张图片没内联（超出上限或格式不支持）`);
     }
+    let mediaId = "";
     if (target.kind === "kb" && target.kbId) {
       const noteId = await client.importDoc(content, title);
-      await client.addKnowledge(target.kbId, {
+      mediaId = await client.addKnowledge(target.kbId, {
         mediaType: 11,
         noteId,
         title,
@@ -621,19 +711,19 @@ async function pushOne(
     } else {
       await client.importDoc(content, title, target.noteFolderId || undefined);
     }
-    return "pushed";
+    return { status: "pushed", mediaId };
   } else {
     if (target.kind === "note") {
-      return "skipped-noteonly"; // 个人笔记仅支持 md
+      return { status: "skipped-noteonly", mediaId: "" }; // 个人笔记仅支持 md
     }
-    if (!target.kbId) return "skipped";
+    if (!target.kbId) return { status: "skipped", mediaId: "" };
     const pf = preflightForExt(ext);
-    if (!pf) return "skipped-unsupported";
+    if (!pf) return { status: "skipped-unsupported", mediaId: "" };
     const buf = Buffer.from(pre && pre.bytes ? pre.bytes : await vault.readBinary(file));
     const cm = await client.createMedia(file.name, buf.length, pf.contentType, ext, target.kbId);
     const cred: any = cm.cos_credential;
     await client.uploadCos(buf, cred, pf.contentType);
-    await client.addKnowledge(target.kbId, {
+    const mediaId = await client.addKnowledge(target.kbId, {
       mediaType: pf.mediaType,
       mediaId: cm.media_id,
       title,
@@ -645,7 +735,7 @@ async function pushOne(
         file_name: file.name,
       },
     });
-    return "pushed";
+    return { status: "pushed", mediaId };
   }
 }
 
@@ -1137,6 +1227,8 @@ export interface KbPullOpts {
    * 返回图片存放目录（vault 相对路径，"" = 根）。不传 = 保持原样（只有外链）。
    */
   imageDirFor?: (notePath: string) => string;
+  /** 拉取时整棵跳过的文件夹名（回收站）：里面的条目是 IMA 侧的旧版/已删内容 */
+  skipFolders?: string[];
 }
 
 // 拉取知识库到 vault 文件夹（递归）：
@@ -1251,6 +1343,11 @@ export async function pullKnowledgeBase(
       for (const it of items) {
         if (it.media_type === 99) {
           const seg = safeName(it.title || it.name || "folder");
+          // 回收站里的东西不必拉回本地（它们是 IMA 侧的旧版/已删条目）
+          if ((opts.skipFolders || []).includes(seg)) {
+            onLog && onLog(`跳过回收站目录「${seg}」`);
+            continue;
+          }
           await ensureFolder(vault, joinPath(relDir, seg));
           await recurse(it.media_id, joinPath(relDir, seg));
         }

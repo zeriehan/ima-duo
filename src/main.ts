@@ -21,10 +21,12 @@ import {
   diffProfile,
   PushOpts,
   PushState,
+  PushRecord,
   SyncDiff,
   staleRecords,
   supersededTitles,
   sameBytes,
+  recycleDeletedEntries,
 } from "./sync";
 import { KbEntry, KbFolder, KbInfo, PushTarget } from "./types";
 import {
@@ -113,6 +115,10 @@ interface ImaDuoSettings {
    * IMA 笔记接口不收本地图片，只能这样让图跟着笔记走。
    */
   pushLocalImages: boolean;
+  /** 推送时把旧版 / 已删除条目移进知识库里的「回收站」文件夹（默认开） */
+  recycleBinEnabled: boolean;
+  /** 回收站文件夹名 */
+  recycleBinName: string;
 
   /**
    * 推送记录：`分身id|目标key|文件vault路径` → {size,mtime,hash,title,version}。
@@ -185,6 +191,8 @@ const DEFAULT_SETTINGS: ImaDuoSettings = {
   pushTarget: null,
   onDuplicate: "skip",
   pushLocalImages: true,
+  recycleBinEnabled: true,
+  recycleBinName: "回收站",
   pushState: {},
   skipOldVersions: true,
   pullNotesEnabled: false,
@@ -599,10 +607,51 @@ export default class ImaDuoPlugin extends Plugin {
     return [noteDir, folder].filter(Boolean).join("/");
   }
 
+  /** 拉取时整棵跳过的目录（回收站） */
+  private recycleSkipFolders(): string[] {
+    if (this.settings.recycleBinEnabled === false) return [];
+    return [(this.settings.recycleBinName || "回收站").trim() || "回收站"];
+  }
+
   /** 传给 sync 层的图片目录回调；关掉时给 undefined（正文原样写入，只保留外链） */
   private imageDirOption(): ((notePath: string) => string) | undefined {
     if (!this.settings.downloadNoteImages) return undefined;
     return (p) => this.noteImageDirFor(p) ?? "";
+  }
+
+  /**
+   * 取知识库根目录下的「回收站」文件夹；没有就建一个。
+   * IMA 没有删除接口，删除与旧版只能靠把它移进这里 —— 用户事后可在客户端全选删掉。
+   */
+  async ensureRecycleFolder(client: ImaClient, kbId: string): Promise<{ id: string; name: string } | null> {
+    const name = (this.settings.recycleBinName || "回收站").trim() || "回收站";
+    type KbPage = {
+      knowledge_list?: Array<{ media_type?: number | string; title?: string; media_id?: string }>;
+      is_end?: boolean;
+      next_cursor?: string;
+    };
+    try {
+      let cursor = "";
+      for (let i = 0; i < 10; i++) {
+        const d = (await client.call("openapi/wiki/v1/get_knowledge_list", {
+          knowledge_base_id: kbId,
+          cursor,
+          limit: 50,
+        })) as KbPage;
+        const list = d.knowledge_list || [];
+        const hit = list.find((x) => Number(x.media_type) === 99 && x.title === name);
+        if (hit && hit.media_id) return { id: String(hit.media_id), name };
+        if (d.is_end || !d.next_cursor) break;
+        cursor = d.next_cursor;
+      }
+      const id = await client.createFolder(kbId, name);
+      if (!id) return null;
+      this.log(`已在知识库里建「${name}」文件夹（${id}）`);
+      return { id, name };
+    } catch (e) {
+      this.log(`准备「${name}」文件夹失败：${String(e)}`);
+      return null;
+    }
   }
 
   /** 知识库显示名：实时缓存 → 持久化名字表 → id 前缀 */
@@ -1301,10 +1350,33 @@ export default class ImaDuoPlugin extends Plugin {
           if (k.startsWith(prefix)) prev[k.slice(prefix.length)] = v;
         }
         const fresh: PushState = {};
+        const recycle =
+          target.kind === "kb" && target.kbId && this.settings.recycleBinEnabled !== false
+            ? await this.ensureRecycleFolder(client, target.kbId)
+            : null;
+        // 本地已删除的：把 IMA 上的条目搬进回收站，并从记录里清掉（搬不动的留着下次再试）
+        if (recycle && target.kbId) {
+          const gone: Array<{ path: string; rec: PushRecord }> = [];
+          for (const [gp, rec] of Object.entries(prev)) {
+            if (!this.app.vault.getAbstractFileByPath(gp)) gone.push({ path: gp, rec });
+          }
+          if (gone.length > 0) {
+            const r = await recycleDeletedEntries(client, target.kbId, recycle.id, recycle.name, gone, (m) =>
+              this.log(m),
+            );
+            for (const g of gone) {
+              if (r.movedPaths.includes(g.path)) delete stateAll[prefix + g.path];
+            }
+            if (r.moved > 0) this.log("本地已删除 " + r.moved + " 条 → 已移入「" + recycle.name + "」");
+            if (r.skipped > 0)
+              this.log("有 " + r.skipped + " 条删除没能搬进回收站（缺少 media_id，多为升级前推的）");
+          }
+        }
         const opts: PushOpts = {
           ...base,
           kbBasePath: target.kind === "kb" ? target.kbFolderPath || "" : "",
           prev,
+          recycle: recycle ? { folderId: recycle.id, folderName: recycle.name } : undefined,
           onRecord: (p, rec) => {
             fresh[p] = rec;
           },
@@ -1907,6 +1979,7 @@ export default class ImaDuoPlugin extends Plugin {
           nestKbName: ref ? ref.nestKbName : false,
           skipOldVersions: this.settings.skipOldVersions !== false,
           imageDirFor: this.imageDirOption(),
+          skipFolders: this.recycleSkipFolders(),
         },
         (m) => this.log(m),
       );
@@ -2042,6 +2115,7 @@ export default class ImaDuoPlugin extends Plugin {
                 nestKbName: prof.nestKbName,
                 skipOldVersions: this.settings.skipOldVersions !== false,
                 imageDirFor: this.imageDirOption(),
+                skipFolders: this.recycleSkipFolders(),
               },
               (m) => this.log(m),
             );
@@ -3263,6 +3337,40 @@ class ImaDuoSettingTab extends PluginSettingTab {
           .setButtonText("全部推送")
           .setDisabled(pushProfiles.length === 0)
           .onClick(() => this.plugin.confirmRunAllPush()),
+      );
+
+    new Setting(pushBox)
+      .setName("旧版与已删除项进「回收站」")
+      .setDesc(
+        richDesc((w) => {
+          w.appendText("IMA 没有删除接口。开启后：");
+          w.createEl("strong", { text: "改动过的文件，新内容沿用原文件名" });
+          w.appendText("（不再带 ");
+          w.createEl("code", { text: "@v2" });
+          w.appendText("），旧版移到知识库根目录的「回收站」；");
+          w.appendText("本地删掉的文件，也把 IMA 上对应条目移进去。拉取时会整棵跳过这个文件夹。");
+          w.createEl("strong", { text: "回收站不会自动清空" });
+          w.appendText("，需要你在 IMA 客户端里全选删除。");
+        }),
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.recycleBinEnabled !== false).onChange(async (v) => {
+          this.plugin.settings.recycleBinEnabled = v;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(pushBox)
+      .setName("回收站文件夹名")
+      .setDesc("默认「回收站」，建在各推送目标知识库的根目录下。")
+      .addText((t) =>
+        t
+          .setPlaceholder("回收站")
+          .setValue(this.plugin.settings.recycleBinName || "回收站")
+          .onChange(async (v) => {
+            this.plugin.settings.recycleBinName = v.trim() || "回收站";
+            await this.plugin.saveSettings();
+          }),
       );
 
     new Setting(pushBox)
