@@ -666,6 +666,169 @@ export function sameBytes(a: ArrayBuffer, b: ArrayBuffer): boolean {
   return true;
 }
 
+// ───────────────────────── 笔记里的图片本地化 ─────────────────────────
+
+/**
+ * IMA 笔记正文里的图片有两种写法，都不是"本地文件"：
+ *  1. 带签名的临时外链 `https://notebook.ima.myqcloud.com/...?t=...&sign=...`
+ *     —— 签名会过期；正文里 `&` 还被转义成 `\&`，Obsidian 常把它当坏链。
+ *  2. `data:image/png;base64,...` 内联 —— 阅读视图支持不稳，还把 md 撑得很大。
+ * 所以拉取时把图片下下来存进 vault，并把链接换成本地相对路径。
+ */
+const IMA_IMAGE_HOST = /^https?:\/\/([a-z0-9-]+\.)*(myqcloud\.com|ima\.qq\.com)\//i;
+
+/** 文件头嗅探：签名链接常把扩展名藏在 query 里，别只信 URL */
+function sniffImageExt(b: Uint8Array): string | null {
+  if (b.length < 12) return null;
+  const at = (i: number) => b[i];
+  if (at(0) === 0x89 && at(1) === 0x50 && at(2) === 0x4e && at(3) === 0x47) return "png";
+  if (at(0) === 0xff && at(1) === 0xd8 && at(2) === 0xff) return "jpg";
+  if (at(0) === 0x47 && at(1) === 0x49 && at(2) === 0x46) return "gif";
+  if (at(0) === 0x42 && at(1) === 0x4d) return "bmp";
+  const riff = String.fromCharCode(at(0), at(1), at(2), at(3));
+  const webp = String.fromCharCode(at(8), at(9), at(10), at(11));
+  if (riff === "RIFF" && webp === "WEBP") return "webp";
+  return null;
+}
+
+function imageExtOf(url: string): string | null {
+  const noQuery = url.split(/[?#]/)[0];
+  const m = /\.([a-z0-9]+)$/i.exec(noQuery);
+  const ext = m ? m[1].toLowerCase() : "";
+  return /^(png|jpe?g|gif|webp|bmp|svg|avif|tiff?)$/.test(ext) ? ext.replace("jpeg", "jpg") : null;
+}
+
+/** `a/b.md` 引用 `a/_attachments/x.png` → `_attachments/x.png`；跨目录 → `../…` */
+export function relativeLink(fromDir: string, toPath: string): string {
+  const from = fromDir ? fromDir.split("/") : [];
+  const to = toPath.split("/");
+  const file = to.pop() || "";
+  let i = 0;
+  while (i < from.length && i < to.length && from[i] === to[i]) i++;
+  const segs = [
+    ...Array.from({ length: from.length - i }, () => ".."),
+    ...to.slice(i),
+    file,
+  ];
+  return segs.join("/");
+}
+
+function base64ToBuffer(b64: string): ArrayBuffer {
+  const buf = Buffer.from(b64.replace(/\s+/g, ""), "base64");
+  return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+}
+
+export interface LocalizeResult {
+  text: string;
+  /** 新落盘的图片数（同一张图多处引用只算一次/只写一份） */
+  saved: number;
+  /** 下载失败、保留原链接的图片数 */
+  failed: number;
+}
+
+/**
+ * 把正文里的图片落成本地文件并改写链接。
+ * `dirFor(notePath)` 决定存哪（返回 vault 相对目录，"" = 根）。
+ * 只处理 IMA 自己的图片域名与 data: URI —— 别人家的外链不动，免得替用户抓一堆网图。
+ */
+export async function localizeNoteImages(
+  content: string,
+  notePath: string,
+  client: ImaClient,
+  vault: Vault,
+  dirFor: (notePath: string) => string,
+  onLog?: (msg: string) => void,
+): Promise<LocalizeResult> {
+  const dir = normRel(dirFor(notePath));
+  const noteDir = notePath.includes("/") ? notePath.slice(0, notePath.lastIndexOf("/")) : "";
+  const seen = new Map<string, string | null>();
+  let saved = 0;
+  let failed = 0;
+
+  const resolve = async (raw: string): Promise<string | null> => {
+    // 正文里的转义：`\&` 是 IMA 序列化带出来的，`&amp;` 是 HTML 里的写法
+    const src = raw.trim().replace(/^<|>$/g, "").replace(/\\&/g, "&").replace(/&amp;/g, "&");
+    // 同一个 URL 只下一份（`\&` 与 `&` 两种写法要归一到同一个 key，否则会存两份）
+    const key = src;
+    if (seen.has(key)) return seen.get(key) ?? null;
+
+    let bytes: ArrayBuffer | null = null;
+    let ext = "png";
+    if (/^data:image\//i.test(src)) {
+      const m = /^data:image\/([a-z0-9.+-]+);base64,([\s\S]+)$/i.exec(src);
+      if (!m) {
+        seen.set(key, null);
+        return null; // 非 base64 的 data URI，留着原样
+      }
+      ext = m[1].toLowerCase().replace("svg+xml", "svg").replace("jpeg", "jpg");
+      bytes = base64ToBuffer(m[2]);
+    } else if (IMA_IMAGE_HOST.test(src)) {
+      try {
+        bytes = await client.downloadBuffer(src);
+      } catch (e) {
+        failed++;
+        seen.set(key, null);
+        onLog && onLog(`图片下载失败（保留原链接）${src.slice(0, 100)}：${String(e)}`);
+        return null;
+      }
+      ext = imageExtOf(src) || sniffImageExt(new Uint8Array(bytes)) || "png";
+    } else {
+      seen.set(key, null);
+      return null; // 非 IMA 图片，不动
+    }
+
+    if (!bytes || bytes.byteLength === 0) {
+      failed++;
+      seen.set(key, null);
+      onLog && onLog(`图片内容为空（保留原链接）${src.slice(0, 100)}`);
+      return null;
+    }
+
+    const name = `ima-${fnv1aText(key).slice(0, 8)}.${ext}`;
+    const target = joinPath(dir, name);
+    if (dir) await ensureFolder(vault, dir);
+    await writeBinaryReconciled(vault, target, bytes);
+    saved++;
+    const link = relativeLink(noteDir, target);
+    seen.set(key, link);
+    onLog && onLog(`图片落地 ${name}（${bytes.byteLength} 字节）← ${src.slice(0, 80)}`);
+    return link;
+  };
+
+  // ① Markdown 图片：![alt](url "title")，url 可能是 <...> 包起来、可能是超长 data URI
+  let out = "";
+  let last = 0;
+  const mdRe = /!\[([^\]]*)\]\(\s*(<[^>]*>|[^\s)]+)(?:\s+["'][^"']*["'])?\s*\)/g;
+  for (const m of content.matchAll(mdRe)) {
+    const idx = m.index || 0;
+    const link = await resolve(m[2]);
+    out += content.slice(last, idx);
+    out += link ? `![${m[1]}](${link})` : m[0];
+    last = idx + m[0].length;
+  }
+  out += content.slice(last);
+
+  // ② HTML <img src="...">：只换 src，其余属性原样保留
+  let html = "";
+  last = 0;
+  const tagRe = /<img\b[^>]*>/gi;
+  for (const m of out.matchAll(tagRe)) {
+    const idx = m.index || 0;
+    const tag = m[0];
+    const sm = /\bsrc\s*=\s*("([^"]*)"|'([^']*)')/i.exec(tag);
+    let nextTag = tag;
+    if (sm) {
+      const link = await resolve(sm[2] !== undefined ? sm[2] : sm[3]);
+      if (link) nextTag = tag.replace(sm[0], `src="${link}"`);
+    }
+    html += out.slice(last, idx) + nextTag;
+    last = idx + tag.length;
+  }
+  html += out.slice(last);
+
+  return { text: html, saved, failed };
+}
+
 export interface PullResult {
   /** 实际落盘的文件数（新建 + 覆盖） */
   count: number;
@@ -688,6 +851,7 @@ export async function pullNotes(
   destFolder: string,
   notebook: { id: string; name: string } | null,
   onLog?: (msg: string) => void,
+  imageDirFor?: (notePath: string) => string,
 ): Promise<PullResult> {
   let groups: { name: string; notes: any[] }[] = [];
   if (!notebook || notebook.id === "") {
@@ -714,7 +878,11 @@ export async function pullNotes(
         const p = `${folder}/${title}.md`;
         const url = await client.exportNoteUrl(note.note_id);
         const txt = await client.downloadText(url);
-        const outcome = await writeTextReconciled(vault, p, txt);
+        let body = txt;
+        if (imageDirFor && body) {
+          body = (await localizeNoteImages(body, p, client, vault, imageDirFor, onLog)).text;
+        }
+        const outcome = await writeTextReconciled(vault, p, body);
         if (outcome === "unchanged") {
           tally.unchanged++;
           onLog && onLog(`未变化 ${title}（跳过）`);
@@ -750,6 +918,11 @@ export interface KbPullOpts {
    * 多出一份同内容的重复文件。要在本地留全历史时才设为 false。
    */
   skipOldVersions?: boolean;
+  /**
+   * 给了它就把笔记正文里的图片（IMA 签名外链 / base64 内联）落到本地，
+   * 返回图片存放目录（vault 相对路径，"" = 根）。不传 = 保持原样（只有外链）。
+   */
+  imageDirFor?: (notePath: string) => string;
 }
 
 // 拉取知识库到 vault 文件夹（递归）：
@@ -819,7 +992,12 @@ export async function pullKnowledgeBase(
             }
             const content = await client.getDocContent(docId);
             const p = joinPath(relDir, `${title}.md`);
-            tallyPull(await writeTextReconciled(vault, p, content || ""), p, `笔记 ${title}`);
+            let text = content || "";
+            // 笔记里的图片是签名外链 / base64，不落盘就是"看得见但打不开"
+            if (opts.imageDirFor && text) {
+              text = (await localizeNoteImages(text, p, client, vault, opts.imageDirFor, onLog)).text;
+            }
+            tallyPull(await writeTextReconciled(vault, p, text), p, `笔记 ${title}`);
           } else {
             // 文件型：**任何**非笔记、非文件夹的条目都能经 url_info 拿到原件，
             // 别只认 media_type=1。pdf(1)/doc(3)/ppt(4)/xls(5)/图片(9)/txt(13)/

@@ -143,6 +143,21 @@ interface ImaDuoSettings {
   pulledPaths: string[];
   enableDebugLog: boolean;
 
+  /**
+   * 拉取笔记时把正文里的图片落成本地文件（默认开）。
+   * IMA 给的是**带签名的临时外链**，或 base64 内联；不落地就"看得见、打不开"，
+   * 且链接几小时后失效 —— 见 issue #1。
+   */
+  downloadNoteImages: boolean;
+  /**
+   * 图片存哪：
+   *  - "sibling"（默认）：笔记同级目录下的 `noteImageFolder`（默认 `_attachments`），跟着笔记走
+   *  - "obsidian"：按 Obsidian 自己的「附件默认位置」设置（`attachmentFolderPath`）
+   */
+  noteImageLocation: "sibling" | "obsidian";
+  /** sibling 模式下的文件夹名（相对笔记所在目录） */
+  noteImageFolder: string;
+
   /** 自动同步总开关：关闭时不起定时器，一切照旧手动跑 */
   autoSyncEnabled: boolean;
   /** 每天自动同步的时刻表（24 小时制 "HH:MM"，已排序去重）。空数组 = 不自动跑 */
@@ -177,6 +192,9 @@ const DEFAULT_SETTINGS: ImaDuoSettings = {
   forceReadingMode: false,
   pulledPaths: [],
   enableDebugLog: false,
+  downloadNoteImages: true,
+  noteImageLocation: "sibling",
+  noteImageFolder: "_attachments",
   autoSyncEnabled: false,
   autoSyncTimes: ["09:00"],
   autoSyncMode: "both",
@@ -537,6 +555,35 @@ export default class ImaDuoPlugin extends Plugin {
     return kbs;
   }
 
+  /** 笔记图片该存到哪（vault 相对目录，"" = vault 根）；「下载笔记图片」关掉时返回 null */
+  noteImageDirFor(notePath: string): string | null {
+    if (!this.settings.downloadNoteImages) return null;
+    const cut = notePath.lastIndexOf("/");
+    const noteDir = cut >= 0 ? notePath.slice(0, cut) : "";
+    const trim = (p: string) => p.replace(/^\/+/, "").replace(/\/+$/, "");
+    if (this.settings.noteImageLocation === "obsidian") {
+      let cfg = "";
+      try {
+        const v = this.app.vault as unknown as { getConfig?: (k: string) => unknown };
+        cfg = String(v.getConfig?.("attachmentFolderPath") ?? "").trim();
+      } catch {
+        cfg = "";
+      }
+      if (!cfg || cfg === "/") return "";
+      if (cfg === "./") return noteDir;
+      if (cfg.startsWith("./")) return [noteDir, trim(cfg.slice(2))].filter(Boolean).join("/");
+      return trim(cfg);
+    }
+    const folder = trim(this.settings.noteImageFolder || "_attachments");
+    return [noteDir, folder].filter(Boolean).join("/");
+  }
+
+  /** 传给 sync 层的图片目录回调；关掉时给 undefined（正文原样写入，只保留外链） */
+  private imageDirOption(): ((notePath: string) => string) | undefined {
+    if (!this.settings.downloadNoteImages) return undefined;
+    return (p) => this.noteImageDirFor(p) ?? "";
+  }
+
   /** 知识库显示名：实时缓存 → 持久化名字表 → id 前缀 */
   kbNameOf(id: string): string {
     const hit = this.kbCache.find((k) => k.id === id);
@@ -636,9 +683,19 @@ export default class ImaDuoPlugin extends Plugin {
     return result;
   }
 
+  /**
+   * 是不是「拉取时落下来的图片」（`_attachments/ima-1a2b3c4d.webp`）。
+   * 这些是笔记正文的附件，不是要同步的笔记：不排除的话，下一次推送会把它们
+   * 当成图片条目一条条传回 IMA，越同步越脏。
+   */
+  private isPulledImage(path: string): boolean {
+    const name = path.split("/").pop() || "";
+    return /^ima-[0-9a-f]{8}\.(png|jpe?g|webp|gif|bmp|svg|avif|tiff?)$/i.test(name);
+  }
+
   /** 取某文件夹（vault 相对路径）下的所有文件；"" 或 "/" = 全库 */
   filesUnderPath(folderPath: string): TFile[] {
-    const all = this.app.vault.getFiles();
+    const all = this.app.vault.getFiles().filter((f) => !this.isPulledImage(f.path));
     if (!folderPath || folderPath === "/") return all;
     return all.filter((f) => f.path.startsWith(folderPath + "/"));
   }
@@ -1766,6 +1823,7 @@ export default class ImaDuoPlugin extends Plugin {
           dest,
           nb.id === "" ? null : nb,
           (m) => this.log(m),
+          this.imageDirOption(),
         );
         await this.rememberPulled(r.paths);
         new Notice(
@@ -1817,6 +1875,7 @@ export default class ImaDuoPlugin extends Plugin {
           downloadFiles: ref ? ref.downloadFiles : false,
           nestKbName: ref ? ref.nestKbName : false,
           skipOldVersions: this.settings.skipOldVersions !== false,
+          imageDirFor: this.imageDirOption(),
         },
         (m) => this.log(m),
       );
@@ -1918,7 +1977,14 @@ export default class ImaDuoPlugin extends Plugin {
     this.setStatus(`拉取「${prof.name}」中…`);
     try {
       if (prof.includeNotes) {
-        const r = await pullNotes(client, this.app.vault, dest, null, (m) => this.log(m));
+        const r = await pullNotes(
+          client,
+          this.app.vault,
+          dest,
+          null,
+          (m) => this.log(m),
+          this.imageDirOption(),
+        );
         stat.created += r.created;
         stat.updated += r.updated;
         stat.unchanged += r.unchanged;
@@ -1944,6 +2010,7 @@ export default class ImaDuoPlugin extends Plugin {
                 downloadFiles: prof.downloadFiles,
                 nestKbName: prof.nestKbName,
                 skipOldVersions: this.settings.skipOldVersions !== false,
+                imageDirFor: this.imageDirOption(),
               },
               (m) => this.log(m),
             );
@@ -3289,6 +3356,71 @@ class ImaDuoSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }),
       );
+
+    // 笔记里的图片：IMA 给的是签名外链 / base64 内联，不落盘就等于没拉下来
+    new Setting(pullBox)
+      .setName("下载笔记里的图片")
+      .setDesc(
+        richDesc((w) => {
+          w.appendText(
+            "IMA 笔记中的图片是带签名的临时链接（几小时后失效），或直接内嵌在正文里的 base64。开启后拉取时会把它们下载到本地，并把正文里的链接换成本地路径，离线也能看。",
+          );
+        }),
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.downloadNoteImages !== false).onChange(async (v) => {
+          this.plugin.settings.downloadNoteImages = v;
+          await this.plugin.saveSettings();
+          syncImageRows();
+        }),
+      );
+
+    const imgModeSetting = new Setting(pullBox)
+      .setName("图片存到哪")
+      .setDesc(
+        "「笔记同级」存在笔记所在文件夹下的子目录里，笔记连同文件夹一起搬走也不会断链；「按 Obsidian 设置」沿用 Obsidian 自己的「附件默认位置」。",
+      )
+      .addDropdown((d) => {
+        d.addOption("sibling", "笔记同级的子文件夹");
+        d.addOption("obsidian", "按 Obsidian 的附件设置");
+        d.setValue(this.plugin.settings.noteImageLocation === "obsidian" ? "obsidian" : "sibling");
+        d.onChange(async (v) => {
+          this.plugin.settings.noteImageLocation = v === "obsidian" ? "obsidian" : "sibling";
+          await this.plugin.saveSettings();
+          syncImageRows();
+        });
+      });
+
+    const imgFolderSetting = new Setting(pullBox)
+      .setName("图片文件夹名")
+      .setDesc(
+        richDesc((w) => {
+          w.appendText("「笔记同级」模式下用它，默认 ");
+          w.createEl("code", { text: "_attachments" });
+          w.appendText("。文件名按内容哈希生成，同一张图不会重复存。");
+        }),
+      )
+      .addText((t) =>
+        t
+          .setPlaceholder("_attachments")
+          .setValue(this.plugin.settings.noteImageFolder || "_attachments")
+          .onChange(async (v) => {
+            this.plugin.settings.noteImageFolder = v.trim() || "_attachments";
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    const syncImageRows = () => {
+      const on = this.plugin.settings.downloadNoteImages !== false;
+      const sibling = this.plugin.settings.noteImageLocation !== "obsidian";
+      const disable = (s: Setting, off: boolean) => {
+        const f = (s as unknown as { setDisabled?: (v: boolean) => void }).setDisabled;
+        if (f) f.call(s, off);
+      };
+      disable(imgModeSetting, !on);
+      disable(imgFolderSetting, !on || !sibling);
+    };
+    syncImageRows();
 
     const pullProfiles = this.plugin.settings.pullProfiles;
 
