@@ -759,6 +759,8 @@ export async function localizeNoteImages(
   const dir = normRel(dirFor(notePath));
   const noteDir = notePath.includes("/") ? notePath.slice(0, notePath.lastIndexOf("/")) : "";
   const seen = new Map<string, string | null>();
+  /** 本次已经写过的图片（按内容哈希），同一张图只写一次 */
+  const written = new Map<string, string>();
   let saved = 0;
   let failed = 0;
 
@@ -801,14 +803,21 @@ export async function localizeNoteImages(
       return null;
     }
 
-    const name = `ima-${fnv1aText(key).slice(0, 8)}.${ext}`;
+    // ★ 文件名按**图片字节**算，不能按 URL 算：
+    //   IMA 每次返回的图片链接都带新的 `?t=…&sign=…` 签名，URL 一变哈希就变，
+    //   同一个附件每拉一次就落一个新名字 —— 附件目录里堆重复，笔记也被判成"改过"。
+    const digest = fnv1a(new Uint8Array(bytes));
+    const name = `ima-${digest}.${ext}`;
     const target = joinPath(dir, name);
-    if (dir) await ensureFolder(vault, dir);
-    await writeBinaryReconciled(vault, target, bytes);
-    saved++;
+    if (!written.has(name)) {
+      if (dir) await ensureFolder(vault, dir);
+      const outcome = await writeBinaryReconciled(vault, target, bytes);
+      written.set(name, target);
+      if (outcome !== "unchanged") saved++;
+      onLog && onLog(`图片落地 ${name}（${bytes.byteLength} 字节）← ${src.slice(0, 80)}`);
+    }
     const link = relativeLink(noteDir, target);
     seen.set(key, link);
-    onLog && onLog(`图片落地 ${name}（${bytes.byteLength} 字节）← ${src.slice(0, 80)}`);
     return link;
   };
 
