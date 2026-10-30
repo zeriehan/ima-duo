@@ -18,6 +18,8 @@ function describeCode(code: any, msg?: string): string {
     "-1": "返回内容不是合法 JSON，可能是网关或网络中间层返回的错误页",
     "210001": "内容为空或过长，IMA 拒绝接收",
     "210005": "文档/笔记不存在，或该 ID 类型不匹配当前接口",
+    "220004":
+      "知识库 ID 已过期：IMA 已改用 ima_kb_XXXXXXXX 形式的新 ID，旧 ID 一律不受理。请在设置里重新选一次目标知识库（插件也会自动按知识库名重试一次）",
   };
   const hint = map[String(code)];
   const base = msg && msg !== "success" ? msg : "IMA 接口返回错误";

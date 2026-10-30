@@ -183,6 +183,20 @@ const DEFAULT_SETTINGS: ImaDuoSettings = {
   autoSyncLastAt: 0,
 };
 
+/**
+ * IMA 当前签发的知识库 ID 一律长这样：`ima_kb_` + 8 位字母数字。
+ * 2026-10 前后 IMA 把 ID 从原来的长串（base64 风格、以 `=` 结尾）换成了这个格式，
+ * 并且旧 ID 在**所有**接口上都会返回 220004（invalid or outdated knowledge_base_id），
+ * 不是「偶尔失效」而是「彻底不认」。设置里存下来的旧 ID 会让推送/拉取整批失败，
+ * 所以每次同步前都要按名字对一次号。
+ */
+const MODERN_KB_ID = /^ima_kb_[A-Za-z0-9]{8}$/;
+
+/** 存的 id 是否属于 IMA 改版前的旧格式（空值不算旧，只是没填） */
+export function isStaleKbId(id?: string): boolean {
+  return !!id && !MODERN_KB_ID.test(id);
+}
+
 /** 目标的可读标签，用于设置页展示 */
 export function targetLabel(t: PushTarget | null): string {
   if (!t) return "";
@@ -528,6 +542,98 @@ export default class ImaDuoPlugin extends Plugin {
     const hit = this.kbCache.find((k) => k.id === id);
     if (hit) return hit.name;
     return this.settings.pullKbNames[id] || id.slice(0, 8);
+  }
+
+  /**
+   * 把设置里过期的知识库 ID 换成新格式（见 `isStaleKbId` 的说明）。
+   *
+   * 旧 ID 没法换算成新 ID —— IMA 明说了不要构造、不要推断、不要复用，
+   * 只能拿一份**最新的**知识库列表按名字对号。所以这里按「知识库名唯一命中」来配对：
+   *   - 名字只有一个同名库 → 换；
+   *   - 同名库有多个、或名字压根没对上 → 不猜，报给用户去重选（猜错就是往别的库里推）。
+   *
+   * 改 ID 时推送记录的分组键要一起搬：`<分身 id>|kb:<kbId>:<落点>|<文件路径>`，
+   * 只换 kbId 不搬记录，等于把「推过什么」全忘了 —— 下次会把整库重推一遍。
+   */
+  async reconcileKbIds(client?: ImaClient): Promise<{ migrated: number; unresolved: string[] }> {
+    const stale: Array<[string, string]> = []; // [旧 id, 名字线索]
+    const add = (id?: string, name?: string) => {
+      if (!isStaleKbId(id)) return;
+      if (stale.some(([x]) => x === id)) return;
+      stale.push([id, name || this.settings.pullKbNames[id] || ""]);
+    };
+    for (const prof of this.settings.pushProfiles || []) {
+      for (const t of prof.targets || []) if (t.kind === "kb") add(t.kbId, t.kbName);
+    }
+    for (const prof of this.settings.pullProfiles || []) for (const id of prof.kbIds || []) add(id);
+    for (const id of this.settings.pullKbIds || []) add(id);
+
+    const result = { migrated: 0, unresolved: [] as string[] };
+    if (stale.length === 0) return result;
+
+    const c = client || this.getClient();
+    const kbs = await c.listKnowledgeBases();
+    this.kbCache = kbs;
+
+    const map = new Map<string, string>();
+    for (const [oldId, name] of stale) {
+      const hits = name ? kbs.filter((k) => k.name === name) : [];
+      if (hits.length === 1) map.set(oldId, hits[0].id);
+      else result.unresolved.push(name || oldId.slice(0, 8));
+    }
+    if (map.size === 0) return result;
+
+    for (const prof of this.settings.pushProfiles || []) {
+      for (const t of prof.targets || []) {
+        if (t.kind !== "kb" || !t.kbId) continue;
+        const next = map.get(t.kbId);
+        if (!next) continue;
+        t.kbId = next;
+        if (!t.kbName) t.kbName = kbs.find((k) => k.id === next)?.name;
+      }
+    }
+    for (const prof of this.settings.pullProfiles || []) {
+      prof.kbIds = (prof.kbIds || []).map((id) => map.get(id) || id);
+    }
+    this.settings.pullKbIds = (this.settings.pullKbIds || []).map((id) => map.get(id) || id);
+    for (const [oldId, newId] of map) {
+      if (this.settings.pullKbNames[oldId] && !this.settings.pullKbNames[newId]) {
+        this.settings.pullKbNames[newId] = this.settings.pullKbNames[oldId];
+      }
+      delete this.settings.pullKbNames[oldId];
+    }
+
+    // 推送记录分组键随 kbId 一起改（adhoc 推送用的是 `adhoc|<目标 key>|`，同样命中）
+    const state = this.settings.pushState || {};
+    const moved: Record<string, PushState[string]> = {};
+    for (const [key, rec] of Object.entries(state)) {
+      let nextKey = key;
+      for (const [oldId, newId] of map) {
+        nextKey = nextKey.split(`|kb:${oldId}:`).join(`|kb:${newId}:`);
+      }
+      if (nextKey === key) continue;
+      const already = state[nextKey];
+      // 新旧两套记录都在（比如上一次改版只推了一半）：留版本号更大的那份
+      if (already && (already.version || 0) > (rec.version || 0)) delete state[key];
+      else {
+        moved[nextKey] = rec;
+        delete state[key];
+      }
+    }
+    Object.assign(state, moved);
+
+    await this.saveSettings();
+    result.migrated = map.size;
+    this.log(
+      `知识库 ID 已按名字更新 ${map.size} 个：` +
+        Array.from(map)
+          .map(([o, n]) => `${o.slice(0, 8)}…→${n}`)
+          .join("，"),
+    );
+    if (result.unresolved.length) {
+      this.log(`还有 ${result.unresolved.length} 个旧 ID 对不上名字：${result.unresolved.join("、")}`);
+    }
+    return result;
   }
 
   /** 取某文件夹（vault 相对路径）下的所有文件；"" 或 "/" = 全库 */
@@ -1036,6 +1142,25 @@ export default class ImaDuoPlugin extends Plugin {
    * 跑一个推送分身：所有源文件夹的并集 → 依次推到每个目标。
    * 每个目标单独调一次 pushFiles，因此**每个目标各自查重**，互不影响。
    */
+  /** 同步前先把过期的知识库 ID 校准掉；失败不阻断（真正的报错交给请求本身） */
+  private async reconcileBeforeSync(client: ImaClient) {
+    try {
+      const fix = await this.reconcileKbIds(client);
+      if (fix.migrated > 0) {
+        this.notify(`已自动更新 ${fix.migrated} 个知识库 ID（IMA 换了新 ID 格式），本次照常同步`);
+      }
+      if (fix.unresolved.length > 0) {
+        this.notify(
+          `有 ${fix.unresolved.length} 个知识库 ID 已过期（${fix.unresolved.join("、")}），` +
+            `没能自动对上名字，请到设置里重新选一次目标`,
+          8000,
+        );
+      }
+    } catch (e) {
+      this.log(`知识库 ID 校准失败（先按原样继续）：${String(e)}`);
+    }
+  }
+
   async runPushProfile(prof: PushProfile) {
     if (this.pushBusy) {
       this.notify("已有推送任务在进行中，请等它结束");
@@ -1061,6 +1186,8 @@ export default class ImaDuoPlugin extends Plugin {
       this.notify(e.message);
       return;
     }
+
+    await this.reconcileBeforeSync(client);
 
     const base: PushOpts = {
       useFileNameAsTitle: this.settings.useFileNameAsTitle,
@@ -1327,6 +1454,7 @@ export default class ImaDuoPlugin extends Plugin {
     }
     this.setStatus("检查同步差异…");
     new Notice("正在对照两侧差异（要读知识库目录，条目多时需要一会儿）…");
+    await this.reconcileBeforeSync(client);
 
     const blocks: { label: string; diff: SyncDiff }[] = [];
     const stateAll = this.settings.pushState || {};
@@ -1784,6 +1912,7 @@ export default class ImaDuoPlugin extends Plugin {
     const dest = prof.dest || "ima/知识库";
     const stat = { created: 0, updated: 0, unchanged: 0, count: 0, oldVersions: 0 };
     const allPaths: string[] = [];
+    await this.reconcileBeforeSync(client);
     this.pullBusy = true;
     this.log(`—— 开始拉取「${prof.name}」→ ${dest} ——`);
     this.setStatus(`拉取「${prof.name}」中…`);
