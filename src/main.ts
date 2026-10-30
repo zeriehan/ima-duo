@@ -27,6 +27,7 @@ import {
   supersededTitles,
   sameBytes,
   recycleDeletedEntries,
+  tidyRecycleBin,
 } from "./sync";
 import { KbEntry, KbFolder, KbInfo, PushTarget } from "./types";
 import {
@@ -1356,20 +1357,49 @@ export default class ImaDuoPlugin extends Plugin {
             : null;
         // 本地已删除的：把 IMA 上的条目搬进回收站，并从记录里清掉（搬不动的留着下次再试）
         if (recycle && target.kbId) {
-          const gone: Array<{ path: string; rec: PushRecord }> = [];
-          for (const [gp, rec] of Object.entries(prev)) {
-            if (!this.app.vault.getAbstractFileByPath(gp)) gone.push({ path: gp, rec });
-          }
-          if (gone.length > 0) {
-            const r = await recycleDeletedEntries(client, target.kbId, recycle.id, recycle.name, gone, (m) =>
-              this.log(m),
+          const items = Object.entries(prev).map(([gp, rec]) => ({ path: gp, rec }));
+          // 老记录缺 media_id、或还挂着 @vN 旧版 → 需要先全库对一次账（一次就够，之后走轻量路径）
+          const needsTidy = items.some((i) => !i.rec.mediaId || (i.rec.version || 1) > 1);
+          if (items.length > 0 && needsTidy) {
+            this.setStatus(`对账「${prof.name}」：补 media_id、旧版入${recycle.name}…`);
+            const tidy = await tidyRecycleBin(
+              client,
+              target.kbId,
+              { folderId: recycle.id, name: recycle.name },
+              items,
+              (p) => !!this.app.vault.getAbstractFileByPath(p),
+              (m) => this.log(m),
             );
-            for (const g of gone) {
-              if (r.movedPaths.includes(g.path)) delete stateAll[prefix + g.path];
+            for (const k of Object.keys(prev)) delete prev[k];
+            for (const [gp, rec] of Object.entries(tidy.records)) {
+              prev[gp] = rec;
+              stateAll[prefix + gp] = rec;
             }
-            if (r.moved > 0) this.log("本地已删除 " + r.moved + " 条 → 已移入「" + recycle.name + "」");
-            if (r.skipped > 0)
-              this.log("有 " + r.skipped + " 条删除没能搬进回收站（缺少 media_id，多为升级前推的）");
+            for (const gp of tidy.deletedPaths) delete stateAll[prefix + gp];
+            await this.saveSettings();
+            this.log(
+              `对账完成：补 media_id ${tidy.adopted} 条，移入${recycle.name} ${tidy.moved} 条，` +
+                `清掉记录 ${tidy.deletedPaths.length} 条，未认出 ${tidy.unresolved} 条`,
+            );
+            if (tidy.moved > 0) {
+              this.notify(`已把 ${tidy.moved} 个旧版/已删条目移入「${recycle.name}」`);
+            }
+          } else {
+            const gone: Array<{ path: string; rec: PushRecord }> = [];
+            for (const [gp, rec] of Object.entries(prev)) {
+              if (!this.app.vault.getAbstractFileByPath(gp)) gone.push({ path: gp, rec });
+            }
+            if (gone.length > 0) {
+              const r = await recycleDeletedEntries(client, target.kbId, recycle.id, recycle.name, gone, (m) =>
+                this.log(m),
+              );
+              for (const g of gone) {
+                if (r.movedPaths.includes(g.path)) delete stateAll[prefix + g.path];
+              }
+              if (r.moved > 0) this.log("本地已删除 " + r.moved + " 条 → 已移入「" + recycle.name + "」");
+              if (r.skipped > 0)
+                this.log("有 " + r.skipped + " 条删除没能搬进回收站（缺少 media_id，多为升级前推的）");
+            }
           }
         }
         const opts: PushOpts = {

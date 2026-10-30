@@ -192,8 +192,7 @@ export function parseVersionedTitle(title: string): { raw: string; version: numb
 }
 
 /** 变更探测结果；text/bytes 会顺手捎给 pushOne，同一轮不重复读盘 */
-interface Probe {
-  size: number;
+interface Probe {  size: number;
   mtime: number;
   hash: string;
   text?: string;
@@ -672,6 +671,232 @@ export async function recycleDeletedEntries(
     }
   }
   return { moved, skipped, movedPaths };
+}
+
+/** 知识库里的一条（清理规划用；只在知识库内，不含文件夹） */
+export interface CleanupEntry {
+  title: string;
+  mediaId: string;
+  folderPath: string;
+}
+
+/** 一条待搬进回收站的条目 */
+export interface CleanupMove {
+  mediaId: string;
+  title: string;
+  folderPath: string;
+  reason: "old-version" | "duplicate" | "deleted";
+}
+
+export interface CleanupPlan {
+  moves: CleanupMove[];
+  /** 记录缺 media_id、但能在库里唯一对上号的：顺手补上 */
+  adopt: Array<{ path: string; mediaId: string }>;
+  /** 被当成"当前版"留下的重复条目数 */
+  keptDuplicates: number;
+}
+
+/**
+ * 规划一次「旧版 / 重复 / 已删除」清理 —— 纯函数，只算不动。
+ *
+ * 只处理**能确认是插件自己造出来的**东西，避免误伤用户手放的内容：
+ *  - 旧版本：标题是 `X@vN`，且 `X` 现在仍是本地的一个文件；
+ *  - 重复：同一文件夹里标题完全相同的多条，且该标题是本地文件；
+ *  - 已删除：本地没这个路径，但库里在**记录的文件夹**里能唯一对上记录标题。
+ */
+export function planRecycleCleanup(
+  entries: CleanupEntry[],
+  local: { paths: Set<string>; titles: Set<string> },
+  records: Array<{ path: string; title: string; raw?: string; folder: string; mediaId?: string }>,
+  excludeFolder = "回收站",
+): CleanupPlan {
+  const pool = entries.filter(
+    (e) => !e.folderPath.split("/").includes(excludeFolder),
+  );
+  const byId = new Map(pool.map((e) => [e.mediaId, e]));
+  const moving = new Set<string>();
+  const moves: CleanupMove[] = [];
+
+  const push = (e: CleanupEntry, reason: CleanupMove["reason"]) => {
+    if (moving.has(e.mediaId)) return;
+    moving.add(e.mediaId);
+    moves.push({ mediaId: e.mediaId, title: e.title, folderPath: e.folderPath, reason });
+  };
+
+  // ① 旧版本：X@vN，且 X 仍是本地文件（md 的 @vN 不带扩展名，文件型带）
+  for (const e of pool) {
+    const v = parseVersionedTitle(e.title);
+    if (!v) continue;
+    if (local.titles.has(v.raw) || local.titles.has(v.raw.replace(/\.[^.]+$/, ""))) {
+      push(e, "old-version");
+    }
+  }
+
+  // ② 同一文件夹里的同名重复：留一条，其余搬走。优先留下记录里认得的那个
+  const groups = new Map<string, CleanupEntry[]>();
+  for (const e of pool) {
+    if (moving.has(e.mediaId)) continue;
+    const key = `${e.folderPath}\u0000${titleKey(e.title)}`;
+    const arr = groups.get(key);
+    if (arr) arr.push(e);
+    else groups.set(key, [e]);
+  }
+  let keptDuplicates = 0;
+  const known = new Set(records.map((r) => r.mediaId).filter(Boolean) as string[]);
+  for (const arr of groups.values()) {
+    if (arr.length < 2) continue;
+    if (!local.titles.has(arr[0].title)) continue; // 不是本地文件的重名，别碰
+    const keep = arr.find((e) => known.has(e.mediaId)) || arr[0];
+    keptDuplicates++;
+    for (const e of arr) if (e !== keep) push(e, "duplicate");
+  }
+
+  // ③ 本地已删除：按记录的文件夹 + 标题在库里唯一命中才搬
+  for (const r of records) {
+    if (local.paths.has(r.path)) continue;
+    const want = titleKey(r.raw || r.title);
+    const hits = pool.filter(
+      (e) => e.folderPath === (r.folder || "") && titleKey(e.title) === want,
+    );
+    if (hits.length === 1) push(hits[0], "deleted");
+  }
+
+  // ④ 记录缺 media_id：在库里按文件夹 + 标题唯一命中就补上（下次改动就能进回收站）
+  const adopt: Array<{ path: string; mediaId: string }> = [];
+  for (const r of records) {
+    if (r.mediaId || !local.paths.has(r.path)) continue;
+    const want = titleKey(r.title);
+    const hits = pool.filter(
+      (e) => !moving.has(e.mediaId) && e.folderPath === (r.folder || "") && titleKey(e.title) === want,
+    );
+    if (hits.length === 1 && byId.has(hits[0].mediaId)) {
+      adopt.push({ path: r.path, mediaId: hits[0].mediaId });
+    }
+  }
+
+  return { moves, adopt, keptDuplicates };
+}
+
+export interface TidyResult {
+  /** 迁移后的记录（补上了 mediaId、把旧版本号归位） */
+  records: PushState;
+  /** 补上 media_id 的条数 */
+  adopted: number;
+  /** 移进回收站的条目数（旧版 + 已删除） */
+  moved: number;
+  /** 本地确实已不存在、且记录已清掉的路径 */
+  deletedPaths: string[];
+  /** 在知识库里没找到对应条目的记录数 */
+  unresolved: number;
+}
+
+/**
+ * 一次性「对账」：把老记录补上 media_id，并把已经用不到的条目搬进回收站。
+ *
+ * 升级前推的条目没记 `media_id`，回收站就搬不动它们 —— 必须先按「文件夹 + 标题」
+ * 在知识库里认出对应条目。顺便把 @vN 旧版与本地已删除的条目一并搬走，
+ * 否则用户点了推送也看不到任何变化（文件没改，推送本来就会整批跳过）。
+ */
+export async function tidyRecycleBin(
+  client: ImaClient,
+  kbId: string,
+  bin: { folderId: string; name: string },
+  items: Array<{ path: string; rec: PushRecord }>,
+  fileExists: (path: string) => boolean,
+  onLog?: (msg: string) => void,
+): Promise<TidyResult> {
+  const out: PushState = {};
+  let adopted = 0;
+  let moved = 0;
+  let unresolved = 0;
+  const deletedPaths: string[] = [];
+
+  const entries = (await client.listAllKbEntries(kbId)).filter((e) => e.folderPath !== bin.name);
+  const byFolderTitle = new Map<string, { mediaId: string; title: string }>();
+  const byTitle = new Map<string, Array<{ mediaId: string; title: string }>>();
+  for (const e of entries) {
+    byFolderTitle.set(`${e.folderPath}|${titleKey(e.title)}`, e);
+    const arr = byTitle.get(titleKey(e.title)) || [];
+    arr.push(e);
+    byTitle.set(titleKey(e.title), arr);
+  }
+  const lookup = (folder: string, title: string) => {
+    const exact = byFolderTitle.get(`${folder}|${titleKey(title)}`);
+    if (exact) return exact;
+    // 文件夹对不上时退一步：全库同名且唯一才算
+    const loose = byTitle.get(titleKey(title)) || [];
+    return loose.length === 1 ? loose[0] : null;
+  };
+
+  for (const { path, rec } of items) {
+    const next: PushRecord = { ...rec };
+    const alive = fileExists(path);
+    // ① 认领当前条目（老记录没有 media_id）
+    const cur = lookup(rec.folder || "", rec.title) || lookup(rec.folder || "", rec.raw || rec.title);
+    if (cur) {
+      if (!next.mediaId) {
+        next.mediaId = cur.mediaId;
+        adopted++;
+      }
+    } else if (!next.mediaId) {
+      unresolved++;
+      onLog && onLog(`知识库里找不到「${rec.title}」（${rec.folder || "根目录"}），这条记录仍缺 media_id`);
+    }
+
+    // ② 本地已删除：当前条目 + 所有旧版一起进回收站
+    if (!alive) {
+      const ids = new Set<string>();
+      if (cur) ids.add(cur.mediaId);
+      for (const t of supersededTitles(rec)) {
+        const e = lookup(rec.folder || "", t);
+        if (e) ids.add(e.mediaId);
+      }
+      if (ids.size > 0) {
+        try {
+          const ok = await client.moveKnowledge(kbId, [...ids], bin.folderId);
+          if (ok) {
+            moved += ids.size;
+            deletedPaths.push(path);
+            onLog && onLog(`本地已删除「${path}」→ ${ids.size} 个条目移入${bin.name}`);
+            continue; // 记录整条去掉
+          }
+          onLog && onLog(`「${path}」的 ${ids.size} 个条目没能移入${bin.name}`);
+        } catch (e) {
+          onLog && onLog(`「${path}」移入${bin.name}出错：${String(e)}`);
+        }
+      } else {
+        onLog && onLog(`本地已删除「${path}」，但知识库里没找到对应条目（可能已手动删过）`);
+      }
+      out[path] = next;
+      continue;
+    }
+
+    // ③ 文件还在：把 @vN 旧版搬走，版本号归位（今后改动直接沿用原名）
+    const olds = supersededTitles(rec);
+    if (olds.length > 0) {
+      const ids: string[] = [];
+      for (const t of olds) {
+        const e = lookup(rec.folder || "", t);
+        if (e) ids.push(e.mediaId);
+      }
+      if (ids.length > 0) {
+        try {
+          const ok = await client.moveKnowledge(kbId, ids, bin.folderId);
+          if (ok) {
+            moved += ids.length;
+            onLog && onLog(`「${rec.raw}」的 ${ids.length} 个旧版移入${bin.name}`);
+          }
+        } catch (e) {
+          onLog && onLog(`「${rec.raw}」旧版移入${bin.name}出错：${String(e)}`);
+        }
+      }
+      next.version = 1;
+      next.title = rec.raw || rec.title;
+    }
+    out[path] = next;
+  }
+
+  return { records: out, adopted, moved, deletedPaths, unresolved };
 }
 
 async function pushOne(
