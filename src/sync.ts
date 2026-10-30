@@ -825,12 +825,24 @@ export async function tidyRecycleBin(
     arr.push(e);
     byTitle.set(titleKey(e.title), arr);
   }
+  // IMA 会把超长标题截成「前 30 字…」，记录里却是全名：单独建一份前缀索引
+  const truncated = entries.filter((e) => isTruncatedTitle(titleKey(e.title)));
   const lookup = (folder: string, title: string) => {
     const exact = byFolderTitle.get(`${folder}|${titleKey(title)}`);
     if (exact) return exact;
+    const k = titleKey(title);
+    // 先在同一文件夹里找被截断的那条，再放宽到全库
+    const inFolder = truncated.filter(
+      (e) =>
+        e.folderPath === folder &&
+        k.startsWith(titleKey(e.title).replace(/(\.\.\.|…)$/, "")),
+    );
+    if (inFolder.length === 1) return inFolder[0];
     // 文件夹对不上时退一步：全库同名且唯一才算
-    const loose = byTitle.get(titleKey(title)) || [];
-    return loose.length === 1 ? loose[0] : null;
+    const loose = byTitle.get(k) || [];
+    if (loose.length === 1) return loose[0];
+    const anyFolder = truncated.filter((e) => k.startsWith(titleKey(e.title).replace(/(\.\.\.|…)$/, "")));
+    return anyFolder.length === 1 ? anyFolder[0] : null;
   };
 
   for (const { path, rec } of items) {
@@ -883,7 +895,8 @@ export async function tidyRecycleBin(
       const ids: string[] = [];
       for (const t of olds) {
         const e = lookup(rec.folder || "", t);
-        if (e) ids.push(e.mediaId);
+        // 当前条目可能已经被改回原名，别把它当旧版搬走（否则第二次对账会把最新版移进回收站）
+        if (e && e.mediaId !== cur?.mediaId && e.mediaId !== rec.mediaId) ids.push(e.mediaId);
       }
       if (ids.length > 0) {
         try {
