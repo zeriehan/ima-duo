@@ -715,7 +715,7 @@ function imageExtOf(url: string): string | null {
   return /^(png|jpe?g|gif|webp|bmp|svg|avif|tiff?)$/.test(ext) ? ext.replace("jpeg", "jpg") : null;
 }
 
-/** `a/b.md` 引用 `a/attachment/x.png` → `attachment/x.png`；跨目录 → `../…` */
+/** `a/b.md` 引用 `a/attachments/x.png` → `attachments/x.png`；跨目录 → `../…` */
 export function relativeLink(fromDir: string, toPath: string): string {
   const from = fromDir ? fromDir.split("/") : [];
   const to = toPath.split("/");

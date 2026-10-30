@@ -156,7 +156,7 @@ interface ImaDuoSettings {
   downloadNoteImages: boolean;
   /**
    * 图片存哪：
-   *  - "sibling"（默认）：笔记同级目录下的 `noteImageFolder`（默认 `attachment`），跟着笔记走
+   *  - "sibling"（默认）：笔记同级目录下的 `noteImageFolder`（默认 `attachments`），跟着笔记走
    *  - "obsidian"：按 Obsidian 自己的「附件默认位置」设置（`attachmentFolderPath`）
    */
   noteImageLocation: "sibling" | "obsidian";
@@ -200,7 +200,7 @@ const DEFAULT_SETTINGS: ImaDuoSettings = {
   enableDebugLog: false,
   downloadNoteImages: true,
   noteImageLocation: "sibling",
-  noteImageFolder: "attachment",
+  noteImageFolder: "attachments",
   autoSyncEnabled: false,
   autoSyncTimes: ["09:00"],
   autoSyncMode: "both",
@@ -580,7 +580,7 @@ export default class ImaDuoPlugin extends Plugin {
       if (cfg.startsWith("./")) return [noteDir, trim(cfg.slice(2))].filter(Boolean).join("/");
       return trim(cfg);
     }
-    const folder = trim(this.settings.noteImageFolder || "attachment");
+    const folder = trim(this.settings.noteImageFolder || "attachments");
     return [noteDir, folder].filter(Boolean).join("/");
   }
 
@@ -690,7 +690,7 @@ export default class ImaDuoPlugin extends Plugin {
   }
 
   /**
-   * 是不是「拉取时落下来的图片」（`attachment/ima-1a2b3c4d.webp`）。
+   * 是不是「拉取时落下来的图片」（`attachments/ima-1a2b3c4d.webp`）。
    * 这些是笔记正文的附件，不是要同步的笔记：不排除的话，下一次推送会把它们
    * 当成图片条目一条条传回 IMA，越同步越脏。
    */
@@ -3424,16 +3424,16 @@ class ImaDuoSettingTab extends PluginSettingTab {
       .setDesc(
         richDesc((w) => {
           w.appendText("「笔记同级」模式下用它，默认 ");
-          w.createEl("code", { text: "attachment" });
+          w.createEl("code", { text: "attachments" });
           w.appendText("。文件名按内容哈希生成，同一张图不会重复存。");
         }),
       )
       .addText((t) =>
         t
-          .setPlaceholder("attachment")
-          .setValue(this.plugin.settings.noteImageFolder || "attachment")
+          .setPlaceholder("attachments")
+          .setValue(this.plugin.settings.noteImageFolder || "attachments")
           .onChange(async (v) => {
-            this.plugin.settings.noteImageFolder = v.trim() || "attachment";
+            this.plugin.settings.noteImageFolder = v.trim() || "attachments";
             await this.plugin.saveSettings();
           }),
       );
