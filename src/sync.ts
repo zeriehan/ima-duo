@@ -36,6 +36,15 @@ export interface PushOpts {
   /** 关闭查重（不建议；仅用于需要强制全部新建的场合） */
   skipDedupe?: boolean;
   /**
+   * 推送 md 时把正文里的**本地图片**内联成 base64 data URI（默认开）。
+   * IMA 的笔记写入接口只收 Markdown 文本、不收本地图片，而它自己上传的图是
+   * 会过期的签名外链 —— 实测 data URI 能被渲染，所以用内联换取"图随笔记走"。
+   * 关掉后本地图片引用会原样写进笔记（在 IMA 里等于坏链）。
+   */
+  inlineImages?: boolean;
+  /** 内联图片的上限（默认单张 1.5MB、单篇 4MB） */
+  imageLimits?: InlineImageOpts;
+  /**
    * 上次推送记录（键 = 文件的 vault 路径，由调用方持久化）。这是「只推改动」的基础：
    *  - 有记录且内容没变 → 什么都不做（连查重请求都不发）
    *  - 有记录但内容变了 → IMA 没有覆盖接口，只能带版本号另存一份（`名字@v2.pdf`）
@@ -526,7 +535,7 @@ export async function pushFiles(
       onLog && onLog(`⚠️ 查重环节异常，仍继续推送：${e.message}`);
     }
     try {
-      const r = await pushOne(file, title, target, client, vault, opts, folderId, probe);
+      const r = await pushOne(file, title, target, client, vault, opts, folderId, probe, onLog);
       if (r === "pushed") {
         pushed++;
         opts.onRecord &&
@@ -561,6 +570,7 @@ async function pushOne(
   opts: PushOpts,
   folderId: string | null,
   pre?: Probe,
+  onLog?: (msg: string) => void,
 ): Promise<string> {
   const ext = file.extension.toLowerCase();
   if (ext === "md") {
@@ -568,6 +578,13 @@ async function pushOne(
     let content = pre && pre.text !== undefined ? pre.text : await vault.read(file);
     if (opts.useFileNameAsTitle) {
       content = `# ${title}\n\n` + content;
+    }
+    // IMA 收不了本地图片，而它自己的图是过期签名链接 —— 内联成 data URI 才带得走
+    if (opts.inlineImages !== false) {
+      const r = await inlineLocalImages(content, file.path, vault, opts.imageLimits, onLog);
+      content = r.text;
+      if (r.inlined > 0) onLog && onLog(`已把 ${r.inlined} 张本地图片内联进「${title}」`);
+      if (r.skipped > 0) onLog && onLog(`「${title}」有 ${r.skipped} 张图片没内联（超出上限或格式不支持）`);
     }
     if (target.kind === "kb" && target.kbId) {
       const noteId = await client.importDoc(content, title);
@@ -827,6 +844,170 @@ export async function localizeNoteImages(
   html += out.slice(last);
 
   return { text: html, saved, failed };
+}
+
+// ───────────────────────── 推送：把本地图片内联进正文 ─────────────────────────
+
+const MIME_BY_EXT: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  bmp: "image/bmp",
+  svg: "image/svg+xml",
+  avif: "image/avif",
+  tif: "image/tiff",
+  tiff: "image/tiff",
+};
+
+export interface InlineImageOpts {
+  /** 单张图上限（字节），默认 1.5MB */
+  maxSingleBytes?: number;
+  /** 单篇笔记里图片总量上限（字节），默认 4MB —— 别顶到 IMA 的 100009 */
+  maxTotalBytes?: number;
+}
+export const DEFAULT_INLINE_LIMITS = { maxSingleBytes: 1_500_000, maxTotalBytes: 4_000_000 };
+
+/**
+ * 把 md 正文里指向**本地文件**的图片内联成 `data:image/…;base64,…`。
+ *
+ * 为什么非这么做：IMA 的笔记写入接口只收 Markdown 文本，明确不支持本地图片；
+ * 它自己上传的图是 `notebook.ima.myqcloud.com` 上的**临时签名链接**，过期就废。
+ * 实测 data URI 能被 IMA 正常渲染（两版：Markdown 语法与 HTML `<img>` 都试过），
+ * 所以拿"体积"换"图随笔记走"是当前唯一稳的路子。
+ *
+ * 外链（http/https）保持原样：IMA 能直接显示，没必要把别人家的图搬进来。
+ */
+export async function inlineLocalImages(
+  content: string,
+  filePath: string,
+  vault: Vault,
+  opts: InlineImageOpts = {},
+  onLog?: (msg: string) => void,
+): Promise<{ text: string; inlined: number; skipped: number }> {
+  const maxSingle = opts.maxSingleBytes ?? DEFAULT_INLINE_LIMITS.maxSingleBytes;
+  const maxTotal = opts.maxTotalBytes ?? DEFAULT_INLINE_LIMITS.maxTotalBytes;
+  const dir = filePath.includes("/") ? filePath.slice(0, filePath.lastIndexOf("/")) : "";
+  const cache = new Map<string, string | null>();
+  let total = 0;
+  let inlined = 0;
+  let skipped = 0;
+
+  const findPath = (raw: string): string | null => {
+    let p = raw.trim().replace(/^<|>$/g, "");
+    if (!p || /^https?:|^data:|^app:|^file:/i.test(p)) return null;
+    try {
+      p = decodeURI(p);
+    } catch {
+      // 不是合法百分号编码就按原文找
+    }
+    p = p.replace(/^\.\//, "").replace(/[?#].*$/, "");
+    const candidates = p.startsWith("/") ? [p.slice(1)] : [dir ? `${dir}/${p}` : p, p];
+    for (const c of candidates) if (vault.getAbstractFileByPath(c)) return c;
+    // `![[图.png]]` 这种短链接可能只给文件名：全库按名字找，唯一命中才认
+    const base = p.split("/").pop() || "";
+    const hit = vault.getFiles().filter((f) => f.name === base);
+    return hit.length === 1 ? hit[0].path : null;
+  };
+
+  const resolve = async (raw: string): Promise<string | null> => {
+    const src = raw.trim().replace(/^<|>$/g, "");
+    // 外链、已经在正文里的 data URI、宿主内部协议：都不碰
+    if (!src || /^(https?:|data:|app:|file:)/i.test(src)) return null;
+    const p = findPath(src);
+    if (!p) {
+      skipped++;
+      onLog && onLog(`找不到本地图片，保留原引用：${src}`);
+      return null;
+    }
+    if (cache.has(p)) return cache.get(p) ?? null;
+    const f = vault.getAbstractFileByPath(p);
+    if (!(f instanceof TFile)) {
+      cache.set(p, null);
+      return null;
+    }
+    const ext = (p.split(".").pop() || "").toLowerCase();
+    const mime = MIME_BY_EXT[ext];
+    if (!mime) {
+      cache.set(p, null);
+      skipped++;
+      onLog && onLog(`图片未内联（不是常见图片格式）：${p}`);
+      return null;
+    }
+    let bytes: ArrayBuffer;
+    try {
+      bytes = await vault.readBinary(f);
+    } catch (e) {
+      cache.set(p, null);
+      skipped++;
+      onLog && onLog(`图片读不出来，保留原引用：${p}（${String(e)}）`);
+      return null;
+    }
+    if (bytes.byteLength > maxSingle) {
+      cache.set(p, null);
+      skipped++;
+      onLog && onLog(`图片超过单张上限 ${Math.round(maxSingle / 1024)}KB，未内联：${p}`);
+      return null;
+    }
+    if (total + bytes.byteLength > maxTotal) {
+      cache.set(p, null);
+      skipped++;
+      onLog && onLog(`图片总量超过 ${Math.round(maxTotal / 1024)}KB，这篇余下的图未内联：${p}`);
+      return null;
+    }
+    total += bytes.byteLength;
+    const uri = `data:${mime};base64,${Buffer.from(new Uint8Array(bytes)).toString("base64")}`;
+    cache.set(p, uri);
+    inlined++;
+    return uri;
+  };
+
+  // ① `![[图.png]]` / `![[图.png|300]]`：Obsidian 的嵌入语法，IMA 不认，先换成标准图床语法
+  let out = "";
+  let last = 0;
+  const wikiRe = /!\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]/g;
+  for (const m of content.matchAll(wikiRe)) {
+    const idx = m.index || 0;
+    const uri = await resolve(m[1]);
+    out += content.slice(last, idx);
+    out += uri ? `![](${uri})` : m[0];
+    last = idx + m[0].length;
+  }
+  out += content.slice(last);
+
+  // ② `![alt](本地路径)`：只换本地图；外链与已经在正文里的 data URI 原样留着
+  let md = "";
+  last = 0;
+  const mdRe = /!\[([^\]]*)\]\(\s*(<[^>]*>|[^\s)]+)(?:\s+["'][^"']*["'])?\s*\)/g;
+  for (const m of out.matchAll(mdRe)) {
+    const idx = m.index || 0;
+    md += out.slice(last, idx);
+    const uri = await resolve(m[2]);
+    md += uri ? `![${m[1]}](${uri})` : m[0];
+    last = idx + m[0].length;
+  }
+  md += out.slice(last);
+
+  // ③ `<img src="本地路径">`：只换 src
+  let html = "";
+  last = 0;
+  const tagRe = /<img\b[^>]*>/gi;
+  for (const m of md.matchAll(tagRe)) {
+    const idx = m.index || 0;
+    const tag = m[0];
+    const sm = /\bsrc\s*=\s*("([^"]*)"|'([^']*)')/i.exec(tag);
+    let next = tag;
+    if (sm) {
+      const uri = await resolve(sm[2] !== undefined ? sm[2] : sm[3]);
+      if (uri) next = tag.replace(sm[0], `src="${uri}"`);
+    }
+    html += md.slice(last, idx) + next;
+    last = idx + tag.length;
+  }
+  html += md.slice(last);
+
+  return { text: html, inlined, skipped };
 }
 
 export interface PullResult {

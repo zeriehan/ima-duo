@@ -108,6 +108,11 @@ interface ImaDuoSettings {
    * 注意：文件**内容改过**时不受这个开关影响 —— IMA 没有覆盖接口，改过的只能带 @vN 另存。
    */
   onDuplicate: "skip" | "rename";
+  /**
+   * 推送 md 时把正文里的本地图片内联成 base64 data URI（默认开）。
+   * IMA 笔记接口不收本地图片，只能这样让图跟着笔记走。
+   */
+  pushLocalImages: boolean;
 
   /**
    * 推送记录：`分身id|目标key|文件vault路径` → {size,mtime,hash,title,version}。
@@ -179,6 +184,7 @@ const DEFAULT_SETTINGS: ImaDuoSettings = {
   pushFolder: "",
   pushTarget: null,
   onDuplicate: "skip",
+  pushLocalImages: true,
   pushState: {},
   skipOldVersions: true,
   pullNotesEnabled: false,
@@ -1018,6 +1024,7 @@ export default class ImaDuoPlugin extends Plugin {
       baseFolder,
       kbBasePath: target.kind === "kb" ? target.kbFolderPath || "" : "",
       onDuplicate: this.settings.onDuplicate === "rename" ? "rename" : "skip",
+      inlineImages: this.settings.pushLocalImages !== false,
       prev,
       onRecord: (p, rec) => {
         fresh[p] = rec;
@@ -1251,6 +1258,7 @@ export default class ImaDuoPlugin extends Plugin {
       baseFolders: prof.folders,
       keepSourceRoot: prof.keepRoot !== false,
       onDuplicate: this.settings.onDuplicate === "rename" ? "rename" : "skip",
+      inlineImages: this.settings.pushLocalImages !== false,
     };
 
     this.pushBusy = true;
@@ -3231,6 +3239,26 @@ class ImaDuoSettingTab extends PluginSettingTab {
           .setButtonText("全部推送")
           .setDisabled(pushProfiles.length === 0)
           .onClick(() => this.plugin.confirmRunAllPush()),
+      );
+
+    new Setting(pushBox)
+      .setName("推送时内联本地图片")
+      .setDesc(
+        richDesc((w) => {
+          w.appendText(
+            "IMA 的笔记接口不收本地图片，它自己上传的图又是会过期的签名链接。开启后会把正文里的本地图片（含 ",
+          );
+          w.createEl("code", { text: "![[…]]" });
+          w.appendText(
+            " 嵌入）转成 base64 内联进笔记，图就能跟着笔记走；外链图片原样保留。单张上限 1.5MB、单篇总量 4MB，超出部分不内联（日志里会列出来）。",
+          );
+        }),
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.pushLocalImages !== false).onChange(async (v) => {
+          this.plugin.settings.pushLocalImages = v;
+          await this.plugin.saveSettings();
+        }),
       );
 
     new Setting(pushBox)
