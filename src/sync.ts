@@ -784,6 +784,8 @@ export interface TidyResult {
   adopted: number;
   /** 移进回收站的条目数（旧版 + 已删除） */
   moved: number;
+  /** 把带 @vN 的当前条目改回原名的条数 */
+  renamed: number;
   /** 本地确实已不存在、且记录已清掉的路径 */
   deletedPaths: string[];
   /** 在知识库里没找到对应条目的记录数 */
@@ -808,13 +810,16 @@ export async function tidyRecycleBin(
   const out: PushState = {};
   let adopted = 0;
   let moved = 0;
+  let renamed = 0;
   let unresolved = 0;
   const deletedPaths: string[] = [];
 
   const entries = (await client.listAllKbEntries(kbId)).filter((e) => e.folderPath !== bin.name);
   const byFolderTitle = new Map<string, { mediaId: string; title: string }>();
   const byTitle = new Map<string, Array<{ mediaId: string; title: string }>>();
+  const byId = new Map<string, { mediaId: string; title: string }>();
   for (const e of entries) {
+    byId.set(e.mediaId, e);
     byFolderTitle.set(`${e.folderPath}|${titleKey(e.title)}`, e);
     const arr = byTitle.get(titleKey(e.title)) || [];
     arr.push(e);
@@ -831,8 +836,8 @@ export async function tidyRecycleBin(
   for (const { path, rec } of items) {
     const next: PushRecord = { ...rec };
     const alive = fileExists(path);
-    // ① 认领当前条目（老记录没有 media_id）
-    const cur = lookup(rec.folder || "", rec.title) || lookup(rec.folder || "", rec.raw || rec.title);
+    // ① 认领当前条目：先按 media_id（最准，改过名也认得出），再按「文件夹 + 标题」
+    const cur = (rec.mediaId ? byId.get(rec.mediaId) : null) || lookup(rec.folder || "", rec.title) || lookup(rec.folder || "", rec.raw || rec.title);
     if (cur) {
       if (!next.mediaId) {
         next.mediaId = cur.mediaId;
@@ -871,8 +876,9 @@ export async function tidyRecycleBin(
       continue;
     }
 
-    // ③ 文件还在：把 @vN 旧版搬走，版本号归位（今后改动直接沿用原名）
+    // ③ 文件还在：把 @vN 旧版搬走，再把当前条目改回原名（否则 IMA 里永远带着 @v2）
     const olds = supersededTitles(rec);
+    let blocked = false;
     if (olds.length > 0) {
       const ids: string[] = [];
       for (const t of olds) {
@@ -885,18 +891,44 @@ export async function tidyRecycleBin(
           if (ok) {
             moved += ids.length;
             onLog && onLog(`「${rec.raw}」的 ${ids.length} 个旧版移入${bin.name}`);
+          } else {
+            blocked = true;
           }
         } catch (e) {
+          blocked = true;
           onLog && onLog(`「${rec.raw}」旧版移入${bin.name}出错：${String(e)}`);
         }
       }
+    }
+
+    const curVer = cur ? parseVersionedTitle(cur.title) : null;
+    if (cur && curVer) {
+      if (blocked) {
+        // 旧版还在原地，这时改名会撞出两个同名条目 —— 宁可不改
+        next.title = cur.title;
+        next.version = curVer.version;
+        onLog && onLog(`「${cur.title}」的旧版没搬走，暂不改名（避免重名）`);
+      } else {
+        const ok = await client.renameKnowledge(kbId, cur.mediaId, curVer.raw);
+        if (ok) {
+          renamed++;
+          next.title = curVer.raw;
+          next.version = 1;
+          onLog && onLog(`「${cur.title}」改名为「${curVer.raw}」`);
+        } else {
+          next.title = cur.title;
+          next.version = curVer.version;
+          onLog && onLog(`「${cur.title}」改名失败，保留原后缀`);
+        }
+      }
+    } else if (cur) {
       next.version = 1;
-      next.title = rec.raw || rec.title;
+      next.title = cur.title;
     }
     out[path] = next;
   }
 
-  return { records: out, adopted, moved, deletedPaths, unresolved };
+  return { records: out, adopted, moved, renamed, deletedPaths, unresolved };
 }
 
 async function pushOne(

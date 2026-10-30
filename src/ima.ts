@@ -346,6 +346,23 @@ export class ImaClient {
     return mediaIds.every((id) => Number(results[id]?.ret_code) === 0);
   }
 
+  /**
+   * 改条目名字（`rename_knowledge`，未文档化）。
+   * 注意字段是 **`name`**，不是 `title` —— 传 `title` 会报 name 长度不合法。
+   */
+  async renameKnowledge(kbId: string, mediaId: string, name: string): Promise<boolean> {
+    try {
+      await this.call("openapi/wiki/v1/rename_knowledge", {
+        knowledge_base_id: kbId,
+        media_id: mediaId,
+        name,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   // 列出笔记本
   async listNotebook(): Promise<NotebookInfo[]> {
     const list: NotebookInfo[] = [];

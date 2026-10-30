@@ -120,6 +120,8 @@ interface ImaDuoSettings {
   recycleBinEnabled: boolean;
   /** 回收站文件夹名 */
   recycleBinName: string;
+  /** 一次性迁移是否已跑过「把 @vN 当前条目改回原名」（老数据需要补一次） */
+  recycleRenameDone: boolean;
 
   /**
    * 推送记录：`分身id|目标key|文件vault路径` → {size,mtime,hash,title,version}。
@@ -194,6 +196,7 @@ const DEFAULT_SETTINGS: ImaDuoSettings = {
   pushLocalImages: true,
   recycleBinEnabled: true,
   recycleBinName: "回收站",
+  recycleRenameDone: false,
   pushState: {},
   skipOldVersions: true,
   pullNotesEnabled: false,
@@ -1359,7 +1362,8 @@ export default class ImaDuoPlugin extends Plugin {
         if (recycle && target.kbId) {
           const items = Object.entries(prev).map(([gp, rec]) => ({ path: gp, rec }));
           // 老记录缺 media_id、或还挂着 @vN 旧版 → 需要先全库对一次账（一次就够，之后走轻量路径）
-          const needsTidy = items.some((i) => !i.rec.mediaId || (i.rec.version || 1) > 1);
+          const needsTidy =
+            items.some((i) => !i.rec.mediaId || (i.rec.version || 1) > 1) || !this.settings.recycleRenameDone;
           if (items.length > 0 && needsTidy) {
             this.setStatus(`对账「${prof.name}」：补 media_id、旧版入${recycle.name}…`);
             const tidy = await tidyRecycleBin(
@@ -1377,12 +1381,17 @@ export default class ImaDuoPlugin extends Plugin {
             }
             for (const gp of tidy.deletedPaths) delete stateAll[prefix + gp];
             await this.saveSettings();
+            this.settings.recycleRenameDone = true;
+            await this.saveSettings();
             this.log(
               `对账完成：补 media_id ${tidy.adopted} 条，移入${recycle.name} ${tidy.moved} 条，` +
-                `清掉记录 ${tidy.deletedPaths.length} 条，未认出 ${tidy.unresolved} 条`,
+                `改回原名 ${tidy.renamed} 条，清掉记录 ${tidy.deletedPaths.length} 条，未认出 ${tidy.unresolved} 条`,
             );
-            if (tidy.moved > 0) {
-              this.notify(`已把 ${tidy.moved} 个旧版/已删条目移入「${recycle.name}」`);
+            if (tidy.moved > 0 || tidy.renamed > 0) {
+              this.notify(
+                `已把 ${tidy.moved} 个旧版/已删条目移入「${recycle.name}」` +
+                  (tidy.renamed > 0 ? `，并把 ${tidy.renamed} 个条目改回原名` : ""),
+              );
             }
           } else {
             const gone: Array<{ path: string; rec: PushRecord }> = [];
