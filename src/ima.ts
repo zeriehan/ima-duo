@@ -6,7 +6,7 @@ const IMA_BASE = "https://ima.qq.com";
 
 /** 频率限制：IMA 会返回 code 200001（无 message），退避后重试即可 */
 const RATE_LIMIT_CODE = 200001;
-const MAX_RETRY = 3;
+const MAX_RETRY = 6;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
@@ -41,6 +41,9 @@ export class ImaClient {
   key: string;
   private log?: (msg: string) => void;
 
+  /** 上一次真正发出请求的时间：用来把请求摊开，别一秒钟连发十几条把额度打穿 */
+  private lastCallAt = 0;
+
   constructor(cid: string, key: string, log?: (msg: string) => void) {
     this.cid = cid;
     this.key = key;
@@ -59,10 +62,15 @@ export class ImaClient {
   async call(path: string, body: any): Promise<any> {
     for (let attempt = 0; ; attempt++) {
       try {
+        // 最小间隔：IMA 限流按秒计，递归列目录时很容易一秒内连发
+        const gap = Date.now() - this.lastCallAt;
+        if (gap < 350) await sleep(350 - gap);
+        this.lastCallAt = Date.now();
         return await this.callOnce(path, body);
       } catch (e: any) {
         if (Number(e?.code) !== RATE_LIMIT_CODE || attempt >= MAX_RETRY) throw e;
-        const wait = 400 * Math.pow(2, attempt) + Math.floor(Math.random() * 200);
+        // IMA 的限流是按秒计的，退避要够长；上限 8s，避免长任务卡太久也避免把额度打穿
+        const wait = Math.min(8000, 800 * Math.pow(2, attempt)) + Math.floor(Math.random() * 300);
         if (this.log) this.log(`⟳ ${path} 被限流，${wait}ms 后重试（第 ${attempt + 1}/${MAX_RETRY} 次）`);
         await sleep(wait);
       }
@@ -102,6 +110,13 @@ export class ImaClient {
     }
     if (this.log) this.log(`← ${path} HTTP ${r.status} ${JSON.stringify(j).slice(0, 240)}`);
 
+    // ⚠️ 顺序很重要：IMA 的「限流」返回的是 **HTTP 403 + body.code=200001**。
+    // 先按 HTTP 状态判 403 会把它误报成「API Key 失效」，而且让重试逻辑永远看不到 200001。
+    if (j && Number(j.code) === RATE_LIMIT_CODE) {
+      const err: any = new Error(describeCode(j.code, j.msg));
+      err.code = RATE_LIMIT_CODE;
+      throw err;
+    }
     if (r.status === 401 || r.status === 403) {
       const err: any = new Error(
         `鉴权失败（HTTP ${r.status}）：Client ID / API Key 不正确或已失效，请到 ima.qq.com/agent-interface 重新获取`,
